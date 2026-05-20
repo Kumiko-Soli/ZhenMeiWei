@@ -952,8 +952,9 @@ async def slash_purge(interaction: discord.Interaction):
 
 @bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台表格")
 async def slash_refresh(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 正在重新繪製收銀台...", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     await update_cashier_board()
+    await interaction.followup.send("✅ 收銀台已更新完畢！", ephemeral=True)
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
