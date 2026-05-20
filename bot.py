@@ -8,6 +8,8 @@ from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
 load_dotenv()
 
@@ -74,6 +76,22 @@ def get_member_by_discord_id(discord_id: str):
     return data["discord_map"].get(discord_id, None)
 
 # ==================== Bot 設定 ====================
+
+# ==================== 保持在線用的 Web 伺服器 ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "機器人運行中！"
+
+def run_server():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_server)
+    t.daemon = True
+    t.start()
+
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
