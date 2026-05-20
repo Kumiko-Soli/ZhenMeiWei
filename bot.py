@@ -1,87 +1,24 @@
 import os
 import math
 import json
+import base64
 from datetime import datetime
+from flask import Flask
+from threading import Thread
 import discord
 from discord import app_commands
 from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
-from flask import Flask
-from threading import Thread
 
 load_dotenv()
 
 # ==================== 基礎設定 ====================
-MEMBERS_FILE = "members.json"
-CONFIG_FILE  = "config.json"
-
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-
-# ==================== Google Sheets 連線 ====================
-def get_sheets_client():
-    import base64
-    b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
-    if b64:
-        creds_json = json.loads(base64.b64decode(b64).decode("utf-8"))
-        creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-    return gspread.authorize(creds)
-
-def get_worksheets():
-    config = load_config()
-    sheet_id = config.get("sheet_id", "")
-    if not sheet_id:
-        raise ValueError("尚未設定 Google Sheet ID，請聯絡管理員")
-    client = get_sheets_client()
-    spreadsheet = client.open_by_key(sheet_id)
-    expense_ws  = spreadsheet.worksheet("expense")
-    history_ws  = spreadsheet.worksheet("history")
-    return expense_ws, history_ws
-
-# ==================== 設定檔讀寫 ====================
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        default = {
-            "cashier_channel_id":  0,
-            "recovery_channel_id": 0,
-            "sheet_id": ""
-        }
-        save_config(default)
-        return default
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_config(data):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-# ==================== 成員資料讀寫 ====================
-def load_members_data():
-    if not os.path.exists(MEMBERS_FILE):
-        default = {"members": [], "discord_map": {}}
-        save_members_data(default)
-        return default
-    with open(MEMBERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_members_data(data):
-    with open(MEMBERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_members():
-    return load_members_data()["members"]
-
-def get_member_by_discord_id(discord_id: str):
-    data = load_members_data()
-    return data["discord_map"].get(discord_id, None)
-
-# ==================== Bot 設定 ====================
 
 # ==================== 保持在線用的 Web 伺服器 ====================
 app = Flask(__name__)
@@ -98,6 +35,129 @@ def keep_alive():
     t.daemon = True
     t.start()
 
+# ==================== Google Sheets 連線 ====================
+def get_sheets_client():
+    b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+    if b64:
+        creds_json = json.loads(base64.b64decode(b64).decode("utf-8"))
+        creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def get_spreadsheet():
+    sheet_id = os.getenv("GOOGLE_SHEET_ID", "")
+    if not sheet_id:
+        # 嘗試從 config 工作表讀取
+        client = get_sheets_client()
+        # 無法讀取，拋出錯誤
+        raise ValueError("尚未設定 GOOGLE_SHEET_ID 環境變數")
+    client = get_sheets_client()
+    return client.open_by_key(sheet_id)
+
+def get_worksheets():
+    ss = get_spreadsheet()
+    return ss.worksheet("expense"), ss.worksheet("history")
+
+def get_config_ws():
+    return get_spreadsheet().worksheet("config")
+
+def get_members_ws():
+    return get_spreadsheet().worksheet("members")
+
+# ==================== 設定檔讀寫（Google Sheets）====================
+def load_config():
+    try:
+        ws = get_config_ws()
+        rows = ws.get_all_values()
+        config = {}
+        for row in rows[1:]:
+            if row and len(row) >= 2:
+                key, value = row[0], row[1]
+                try:
+                    config[key] = int(value)
+                except ValueError:
+                    config[key] = value
+        return config
+    except Exception:
+        return {"cashier_channel_id": 0, "recovery_channel_id": 0, "sheet_id": ""}
+
+def save_config(key, value):
+    ws = get_config_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == key:
+            ws.update(f"B{i+1}", [[str(value)]])
+            return
+    ws.append_row([key, str(value)])
+
+# ==================== 成員資料讀寫（Google Sheets）====================
+def load_members_data():
+    try:
+        ws = get_members_ws()
+        rows = ws.get_all_values()
+        members = []
+        discord_map = {}
+        for row in rows[1:]:
+            if row and row[0]:
+                members.append(row[0])
+                if len(row) >= 2 and row[1]:
+                    discord_map[row[1]] = row[0]
+        return {"members": members, "discord_map": discord_map}
+    except Exception:
+        return {"members": [], "discord_map": {}}
+
+def add_member_to_sheet(name):
+    ws = get_members_ws()
+    ws.append_row([name, ""])
+
+def remove_member_from_sheet(name):
+    ws = get_members_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == name:
+            ws.delete_rows(i + 1)
+            return
+
+def set_discord_mapping(name, discord_id):
+    ws = get_members_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == name:
+            ws.update(f"B{i+1}", [[discord_id]])
+            return
+
+def rename_member_in_sheets(old_name, new_name):
+    # 更新 members 工作表
+    ws = get_members_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == old_name:
+            ws.update(f"A{i+1}", [[new_name]])
+
+    # 更新 expense 和 history 工作表
+    expense_ws, history_ws = get_worksheets()
+    for sheet_ws in [expense_ws, history_ws]:
+        rows = sheet_ws.get_all_values()
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            updated = [new_name if cell == old_name else cell for cell in row]
+            if updated != row:
+                sheet_ws.update(f"A{i+1}:{chr(65+len(row)-1)}{i+1}", [updated])
+
+def get_members():
+    return load_members_data()["members"]
+
+# ==================== Bot 設定 ====================
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -115,8 +175,8 @@ def get_next_id(expense_ws):
     records = expense_ws.get_all_values()
     if len(records) <= 1:
         return 1
-    max_id = max(int(row[0]) for row in records[1:] if row and row[0].isdigit())
-    return max_id + 1
+    ids = [int(row[0]) for row in records[1:] if row and row[0].isdigit()]
+    return max(ids) + 1 if ids else 1
 
 def save_record(debtor, creditor, amount, rate, item):
     expense_ws, _ = get_worksheets()
@@ -163,17 +223,6 @@ def update_record_by_id(record_id, debtor, creditor, amount, rate, item):
             expense_ws.update(f"A{i+1}:G{i+1}", [[row[0], row[1], debtor, creditor, amount, rate, item]])
             return True
     return False
-
-def rename_member_in_sheets(old_name, new_name):
-    expense_ws, history_ws = get_worksheets()
-    for ws in [expense_ws, history_ws]:
-        rows = ws.get_all_values()
-        for i, row in enumerate(rows):
-            if i == 0:
-                continue
-            updated = [new_name if cell == old_name else cell for cell in row]
-            if updated != row:
-                ws.update(f"A{i+1}:{chr(65+len(row)-1)}{i+1}", [updated])
 
 def has_pending_records(name):
     records = load_records()
@@ -340,6 +389,8 @@ def build_members_display():
             lines.append(f"{i}. {name}　→　<@{discord_id}>")
         else:
             lines.append(f"{i}. {name}　→　（未設定）")
+    if not members:
+        lines.append("（尚無成員）")
     return "\n".join(lines)
 
 class MembersManageView(discord.ui.View):
@@ -355,14 +406,18 @@ class MembersManageView(discord.ui.View):
     @discord.ui.button(label="設定對應", style=discord.ButtonStyle.primary)
     async def set_mapping(self, interaction: discord.Interaction, button: discord.ui.Button):
         members = get_members()
-        view = MappingSelectView(members)
-        await interaction.response.send_message("請選擇要設定對應的成員：", view=view, ephemeral=True)
+        if not members:
+            await interaction.response.send_message("⚠️ 尚無成員，請先新增成員！", ephemeral=True)
+            return
+        await interaction.response.send_message("請選擇要設定對應的成員：", view=MappingSelectView(members), ephemeral=True)
 
     @discord.ui.button(label="改名", style=discord.ButtonStyle.secondary)
     async def rename_member(self, interaction: discord.Interaction, button: discord.ui.Button):
         members = get_members()
-        view = RenameSelectView(members)
-        await interaction.response.send_message("請選擇要改名的成員：", view=view, ephemeral=True)
+        if not members:
+            await interaction.response.send_message("⚠️ 尚無成員！", ephemeral=True)
+            return
+        await interaction.response.send_message("請選擇要改名的成員：", view=RenameSelectView(members), ephemeral=True)
 
     @discord.ui.button(label="新增成員", style=discord.ButtonStyle.success)
     async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -371,13 +426,15 @@ class MembersManageView(discord.ui.View):
     @discord.ui.button(label="移除成員", style=discord.ButtonStyle.danger)
     async def remove_member(self, interaction: discord.Interaction, button: discord.ui.Button):
         members = get_members()
-        view = RemoveSelectView(members)
-        await interaction.response.send_message("請選擇要移除的成員：", view=view, ephemeral=True)
+        if not members:
+            await interaction.response.send_message("⚠️ 尚無成員！", ephemeral=True)
+            return
+        await interaction.response.send_message("請選擇要移除的成員：", view=RemoveSelectView(members), ephemeral=True)
 
+# ==================== 設定對應 ====================
 class MappingSelectView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=60)
-        self.selected = None
         select = discord.ui.Select(
             placeholder="選擇成員",
             options=[discord.SelectOption(label=m, value=m) for m in members]
@@ -386,8 +443,7 @@ class MappingSelectView(discord.ui.View):
         self.add_item(select)
 
     async def select_callback(self, interaction: discord.Interaction):
-        self.selected = interaction.data["values"][0]
-        await interaction.response.send_modal(SetMappingModal(self.selected))
+        await interaction.response.send_modal(SetMappingModal(interaction.data["values"][0]))
 
 class SetMappingModal(discord.ui.Modal, title="設定 Discord 對應"):
     def __init__(self, name):
@@ -400,15 +456,15 @@ class SetMappingModal(discord.ui.Modal, title="設定 Discord 對應"):
         self.add_item(self.id_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         discord_id = self.id_input.value.strip()
         if not discord_id.isdigit():
-            await interaction.response.send_message("❌ Discord ID 必須是純數字", ephemeral=True)
+            await interaction.followup.send("❌ Discord ID 必須是純數字", ephemeral=True)
             return
-        data = load_members_data()
-        data["discord_map"][discord_id] = self.name
-        save_members_data(data)
-        await interaction.response.send_message(f"✅ 已設定 {self.name} 對應到 <@{discord_id}>", ephemeral=True)
+        set_discord_mapping(self.name, discord_id)
+        await interaction.followup.send(f"✅ 已設定 {self.name} 對應到 <@{discord_id}>", ephemeral=True)
 
+# ==================== 改名 ====================
 class RenameSelectView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=60)
@@ -420,8 +476,7 @@ class RenameSelectView(discord.ui.View):
         self.add_item(select)
 
     async def select_callback(self, interaction: discord.Interaction):
-        old_name = interaction.data["values"][0]
-        await interaction.response.send_modal(RenameModal(old_name))
+        await interaction.response.send_modal(RenameModal(interaction.data["values"][0]))
 
 class RenameModal(discord.ui.Modal, title="改名"):
     def __init__(self, old_name):
@@ -433,7 +488,7 @@ class RenameModal(discord.ui.Modal, title="改名"):
         )
         self.add_item(self.new_name_input)
 
-async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         new_name = self.new_name_input.value.strip()
         if not new_name:
@@ -443,13 +498,11 @@ async def on_submit(self, interaction: discord.Interaction):
         if new_name in data["members"]:
             await interaction.followup.send(f"❌ 「{new_name}」已經存在於成員名單中", ephemeral=True)
             return
-        data["members"] = [new_name if m == self.old_name else m for m in data["members"]]
-        data["discord_map"] = {k: (new_name if v == self.old_name else v) for k, v in data["discord_map"].items()}
-        save_members_data(data)
         rename_member_in_sheets(self.old_name, new_name)
         await interaction.followup.send(f"✅ 已將「{self.old_name}」改名為「{new_name}」", ephemeral=True)
         await update_cashier_board()
 
+# ==================== 新增成員 ====================
 class AddMemberModal(discord.ui.Modal, title="新增成員"):
     def __init__(self):
         super().__init__()
@@ -457,18 +510,19 @@ class AddMemberModal(discord.ui.Modal, title="新增成員"):
         self.add_item(self.name_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         new_name = self.name_input.value.strip()
         if not new_name:
-            await interaction.response.send_message("❌ 名字不能為空", ephemeral=True)
+            await interaction.followup.send("❌ 名字不能為空", ephemeral=True)
             return
         data = load_members_data()
         if new_name in data["members"]:
-            await interaction.response.send_message(f"❌ 「{new_name}」已經存在於成員名單中", ephemeral=True)
+            await interaction.followup.send(f"❌ 「{new_name}」已經存在於成員名單中", ephemeral=True)
             return
-        data["members"].append(new_name)
-        save_members_data(data)
-        await interaction.response.send_message(f"✅ 已新增成員「{new_name}」", ephemeral=True)
+        add_member_to_sheet(new_name)
+        await interaction.followup.send(f"✅ 已新增成員「{new_name}」", ephemeral=True)
 
+# ==================== 移除成員 ====================
 class RemoveSelectView(discord.ui.View):
     def __init__(self, members):
         super().__init__(timeout=60)
@@ -483,14 +537,11 @@ class RemoveSelectView(discord.ui.View):
         name = interaction.data["values"][0]
         if has_pending_records(name):
             await interaction.response.send_message(
-                f"❌ **{name}** 還有未結帳目，請先結清後再移除。", ephemeral=True
-            )
+                f"❌ **{name}** 還有未結帳目，請先結清後再移除。", ephemeral=True)
             return
-        view = ConfirmRemoveView(name)
         await interaction.response.send_message(
             f"⚠️ 確定要移除成員「{name}」嗎？此操作無法復原。",
-            view=view, ephemeral=True
-        )
+            view=ConfirmRemoveView(name), ephemeral=True)
 
 class ConfirmRemoveView(discord.ui.View):
     def __init__(self, name):
@@ -499,11 +550,9 @@ class ConfirmRemoveView(discord.ui.View):
 
     @discord.ui.button(label="確認移除", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_members_data()
-        data["members"] = [m for m in data["members"] if m != self.name]
-        data["discord_map"] = {k: v for k, v in data["discord_map"].items() if v != self.name}
-        save_members_data(data)
-        await interaction.response.edit_message(content=f"✅ 已移除成員「{self.name}」", view=None)
+        await interaction.response.defer(ephemeral=True)
+        remove_member_from_sheet(self.name)
+        await interaction.edit_original_response(content=f"✅ 已移除成員「{self.name}」", view=None)
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -539,12 +588,14 @@ class SplitPayerView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
         self.payer = None
-        payer_select = discord.ui.Select(
-            placeholder="選擇付錢的人",
-            options=[discord.SelectOption(label=m, value=m) for m in get_members()]
-        )
-        payer_select.callback = self.payer_callback
-        self.add_item(payer_select)
+        members = get_members()
+        if members:
+            payer_select = discord.ui.Select(
+                placeholder="選擇付錢的人",
+                options=[discord.SelectOption(label=m, value=m) for m in members]
+            )
+            payer_select.callback = self.payer_callback
+            self.add_item(payer_select)
 
     async def payer_callback(self, interaction: discord.Interaction):
         self.payer = interaction.data["values"][0]
@@ -587,9 +638,10 @@ class SplitPersonView(discord.ui.View):
         self.state           = state
         self.selected_person = None
         options = [discord.SelectOption(label=m, value=m) for m in get_members() if m != state.payer]
-        self.person_select = discord.ui.Select(placeholder="選擇要加入的分帳人", options=options)
-        self.person_select.callback = self.person_callback
-        self.add_item(self.person_select)
+        if options:
+            self.person_select = discord.ui.Select(placeholder="選擇要加入的分帳人", options=options)
+            self.person_select.callback = self.person_callback
+            self.add_item(self.person_select)
 
     async def person_callback(self, interaction: discord.Interaction):
         self.selected_person = interaction.data["values"][0]
@@ -600,8 +652,7 @@ class SplitPersonView(discord.ui.View):
             )
         else:
             hint = f"👤 現在選擇的欠債者是：**{self.selected_person}**"
-        content = build_split_summary(self.state, hint)
-        await interaction.response.edit_message(content=content, view=self)
+        await interaction.response.edit_message(content=build_split_summary(self.state, hint), view=self)
 
     @discord.ui.button(label="加入此人 →", style=discord.ButtonStyle.primary, row=1)
     async def add_person(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -630,7 +681,7 @@ class SplitRatioModal(discord.ui.Modal, title="填寫分帳比例"):
         )
         self.add_item(self.ratio_input)
 
-async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
         try:
             ratio = float(self.ratio_input.value)
@@ -638,9 +689,7 @@ async def on_submit(self, interaction: discord.Interaction):
                 await interaction.followup.send("❌ 比例必須大於 0", ephemeral=True)
                 return
             self.state.splits[self.person] = ratio
-            new_view = SplitPersonView(self.state)
-            content  = build_split_summary(self.state)
-            await self.state.message.edit(content=content, view=new_view)
+            await self.state.message.edit(content=build_split_summary(self.state), view=SplitPersonView(self.state))
         except ValueError:
             await interaction.followup.send("❌ 比例必須是數字", ephemeral=True)
 
@@ -669,35 +718,37 @@ class RecordModal(discord.ui.Modal, title="新增記帳資料"):
         self.add_item(self.rate_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
             amt = float(self.amount_input.value)
             rt  = float(self.rate_input.value)
-            await interaction.response.defer(ephemeral=True)
             new_id = save_record(self.debtor, self.creditor, amt, rt, self.item_input.value)
-            await interaction.response.followup.send(f"✅ [編號 {new_id:03d}] 紀錄成功！", ephemeral=True)
+            await interaction.followup.send(f"✅ [編號 {new_id:03d}] 紀錄成功！", ephemeral=True)
             await update_cashier_board()
         except ValueError:
-            await interaction.response.followup.send("❌ 金額與匯率必須是數字", ephemeral=True)
+            await interaction.followup.send("❌ 金額與匯率必須是數字", ephemeral=True)
 
 class NameSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
         self.debtor   = None
         self.creditor = None
-        debtor_select = discord.ui.Select(
-            placeholder="① 選擇欠債人（誰要付錢）",
-            options=[discord.SelectOption(label=m, value=m) for m in get_members()],
-            custom_id="debtor"
-        )
-        debtor_select.callback = self.debtor_callback
-        self.add_item(debtor_select)
-        creditor_select = discord.ui.Select(
-            placeholder="② 選擇債權人（誰先墊錢）",
-            options=[discord.SelectOption(label=m, value=m) for m in get_members()],
-            custom_id="creditor"
-        )
-        creditor_select.callback = self.creditor_callback
-        self.add_item(creditor_select)
+        members = get_members()
+        if members:
+            debtor_select = discord.ui.Select(
+                placeholder="① 選擇欠債人（誰要付錢）",
+                options=[discord.SelectOption(label=m, value=m) for m in members],
+                custom_id="debtor"
+            )
+            debtor_select.callback = self.debtor_callback
+            self.add_item(debtor_select)
+            creditor_select = discord.ui.Select(
+                placeholder="② 選擇債權人（誰先墊錢）",
+                options=[discord.SelectOption(label=m, value=m) for m in members],
+                custom_id="creditor"
+            )
+            creditor_select.callback = self.creditor_callback
+            self.add_item(creditor_select)
 
     async def debtor_callback(self, interaction: discord.Interaction):
         self.debtor = interaction.data["values"][0]
@@ -724,18 +775,18 @@ class ModifyModal(discord.ui.Modal):
         self.record_id = record_id
         amt_val  = str(int(old_data['amount'])) if old_data['amount'].is_integer() else str(old_data['amount'])
         rate_val = str(int(old_data['rate']))   if old_data['rate'].is_integer()   else str(old_data['rate'])
-        self.debtor_input   = discord.ui.TextInput(label=f"欠債人（目前：{old_data['debtor']}）",   default=old_data['debtor'])
+        self.debtor_input   = discord.ui.TextInput(label=f"欠債人（目前：{old_data['debtor']}）", default=old_data['debtor'])
         self.creditor_input = discord.ui.TextInput(label=f"債權人（目前：{old_data['creditor']}）", default=old_data['creditor'])
         self.item_input     = discord.ui.TextInput(label="項目名稱", default=old_data['item'])
-        self.amount_input   = discord.ui.TextInput(label="金額",     default=amt_val)
-        self.rate_input     = discord.ui.TextInput(label="匯率",     default=rate_val)
+        self.amount_input   = discord.ui.TextInput(label="金額", default=amt_val)
+        self.rate_input     = discord.ui.TextInput(label="匯率", default=rate_val)
         self.add_item(self.debtor_input)
         self.add_item(self.creditor_input)
         self.add_item(self.item_input)
         self.add_item(self.amount_input)
         self.add_item(self.rate_input)
 
-async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         d = self.debtor_input.value.strip()
         c = self.creditor_input.value.strip()
@@ -751,6 +802,70 @@ async def on_submit(self, interaction: discord.Interaction):
         except ValueError:
             await interaction.followup.send("❌ 金額與匯率必須是數字", ephemeral=True)
 
+# ==================== 查帳 View ====================
+class AccountSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        members = get_members()
+        if members:
+            select = discord.ui.Select(
+                placeholder="選擇要查帳的人",
+                options=[discord.SelectOption(label=m, value=m) for m in members]
+            )
+            select.callback = self.select_callback
+            self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        name = interaction.data["values"][0]
+        summary = build_account_summary(name)
+        await interaction.response.edit_message(content="✅ 查詢完成！", view=None)
+        await interaction.channel.send(summary)
+
+# ==================== 設定頻道 Modal ====================
+class SetChannelsModal(discord.ui.Modal, title="設定頻道 ID"):
+    def __init__(self):
+        super().__init__()
+        config = load_config()
+        self.cashier_input = discord.ui.TextInput(
+            label="收銀台頻道 ID",
+            placeholder="右鍵點擊頻道 → 複製頻道 ID",
+            default=str(config.get("cashier_channel_id", "")) if config.get("cashier_channel_id") else ""
+        )
+        self.recovery_input = discord.ui.TextInput(
+            label="餐盤回收區頻道 ID",
+            placeholder="右鍵點擊頻道 → 複製頻道 ID",
+            default=str(config.get("recovery_channel_id", "")) if config.get("recovery_channel_id") else ""
+        )
+        self.add_item(self.cashier_input)
+        self.add_item(self.recovery_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            cashier_id  = int(self.cashier_input.value.strip())
+            recovery_id = int(self.recovery_input.value.strip())
+            save_config("cashier_channel_id", cashier_id)
+            save_config("recovery_channel_id", recovery_id)
+            await interaction.followup.send("✅ 頻道設定完成！", ephemeral=True)
+        except ValueError:
+            await interaction.followup.send("❌ 頻道 ID 必須是純數字", ephemeral=True)
+
+# ==================== 設定試算表 Modal ====================
+class SetSheetModal(discord.ui.Modal, title="設定 Google Sheet ID"):
+    def __init__(self):
+        super().__init__()
+        self.sheet_input = discord.ui.TextInput(
+            label="Google Sheet ID",
+            placeholder="試算表網址中間那串字"
+        )
+        self.add_item(self.sheet_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        sheet_id = self.sheet_input.value.strip()
+        save_config("sheet_id", sheet_id)
+        await interaction.followup.send("✅ 試算表 ID 設定完成！", ephemeral=True)
+
 # ==================== 斜線指令系統 ====================
 @bot.tree.command(name="記帳", description="快速新增記帳 (直接按 Tab 填寫，電腦端推薦)")
 @app_commands.describe(debtor="欠債人", creditor="債權人", amount="金額", rate="匯率", item="項目")
@@ -759,25 +874,26 @@ async def slash_record(interaction: discord.Interaction, debtor: str, creditor: 
     if debtor not in members or creditor not in members:
         await interaction.response.send_message(f"❌ 名字錯誤！合法名單：{', '.join(members)}", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     new_id = save_record(debtor, creditor, amount, rate, item)
-    await interaction.response.send_message(f"✅ [編號 {new_id:03d}] 快速紀錄成功！", ephemeral=True)
+    await interaction.followup.send(f"✅ [編號 {new_id:03d}] 快速紀錄成功！", ephemeral=True)
     await update_cashier_board()
 
 @bot.tree.command(name="表單", description="開啟下拉選單選人，再填寫金額 (手機端推薦)")
 async def slash_modal(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "📋 **步驟一：選擇欠債人和債權人**",
-        view=NameSelectView(),
-        ephemeral=True
-    )
+    members = get_members()
+    if not members:
+        await interaction.response.send_message("⚠️ 尚無成員，請管理員先執行 /成員管理 新增成員！", ephemeral=True)
+        return
+    await interaction.response.send_message("📋 **步驟一：選擇欠債人和債權人**", view=NameSelectView(), ephemeral=True)
 
 @bot.tree.command(name="分帳", description="多人分帳，支援自訂比例")
 async def slash_split(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "💸 **分帳 — 步驟一：選擇付錢的人**",
-        view=SplitPayerView(),
-        ephemeral=True
-    )
+    members = get_members()
+    if not members:
+        await interaction.response.send_message("⚠️ 尚無成員，請管理員先執行 /成員管理 新增成員！", ephemeral=True)
+        return
+    await interaction.response.send_message("💸 **分帳 — 步驟一：選擇付錢的人**", view=SplitPayerView(), ephemeral=True)
 
 @bot.tree.command(name="成員管理", description="查看或管理成員名單與 Discord 對應")
 async def slash_members(interaction: discord.Interaction):
@@ -802,20 +918,23 @@ async def slash_set_sheet(interaction: discord.Interaction):
 
 @bot.tree.command(name="修改", description="修改特定編號的帳目內容")
 async def slash_modify(interaction: discord.Interaction, 編號: int):
+    await interaction.response.defer(ephemeral=True)
     records = load_records()
     old_data = next((r for r in records if r['id'] == 編號), None)
     if not old_data:
-        await interaction.response.send_message(f"❌ 找不到編號 {編號} 的紀錄。", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到編號 {編號} 的紀錄。", ephemeral=True)
         return
+    await interaction.followup.send("請填寫修改內容：", ephemeral=True)
     await interaction.response.send_modal(ModifyModal(編號, old_data))
 
 @bot.tree.command(name="刪除", description="依編號刪除紀錄")
 async def slash_delete(interaction: discord.Interaction, 編號: int):
+    await interaction.response.defer()
     if delete_record_by_id(編號):
-        await interaction.response.send_message(f"🗑️ 已刪除編號 {編號:03d}。")
+        await interaction.followup.send(f"🗑️ 已刪除編號 {編號:03d}。")
         await update_cashier_board()
     else:
-        await interaction.response.send_message(f"❌ 找不到編號 {編號}", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到編號 {編號}", ephemeral=True)
 
 @bot.tree.command(name="清空收銀台", description="強制清空收銀台頻道內的所有訊息")
 async def slash_purge(interaction: discord.Interaction):
@@ -838,14 +957,15 @@ async def slash_refresh(interaction: discord.Interaction):
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "🔍 請選擇要查帳的人：",
-        view=AccountSelectView(),
-        ephemeral=True
-    )
+    members = get_members()
+    if not members:
+        await interaction.response.send_message("⚠️ 尚無成員！", ephemeral=True)
+        return
+    await interaction.response.send_message("🔍 請選擇要查帳的人：", view=AccountSelectView(), ephemeral=True)
 
 @bot.tree.command(name="藍白", description="公審本群最大欠債人！")
 async def slash_blue_white(interaction: discord.Interaction):
+    await interaction.response.defer()
     records = load_records()
     members = get_members()
     net = {m: 0.0 for m in members}
@@ -856,10 +976,10 @@ async def slash_blue_white(interaction: discord.Interaction):
         if r["creditor"] in net:
             net[r["creditor"]] -= amount_ntd
 
-    max_debt = max(net.values())
+    max_debt = max(net.values()) if net else 0
     if max_debt <= 0:
         await interaction.channel.send("🎉 本群目前人人清白，無人欠債！")
-        await interaction.response.send_message("✅ 已發出公告", ephemeral=True)
+        await interaction.followup.send("✅ 已發出公告", ephemeral=True)
         return
 
     top_debtors = [name for name, amt in net.items() if amt == max_debt]
@@ -868,25 +988,22 @@ async def slash_blue_white(interaction: discord.Interaction):
     mentions = []
     for name in top_debtors:
         discord_id = name_to_id.get(name)
-        if discord_id:
-            mentions.append(f"<@{discord_id}>（{name}）")
-        else:
-            mentions.append(name)
+        mentions.append(f"<@{discord_id}>（{name}）" if discord_id else name)
 
-    target_str = "、".join(mentions)
     message = (
-        f"⚖️ **本群目前最大欠債人是 {target_str}**，"
+        f"⚖️ **本群目前最大欠債人是 {'、'.join(mentions)}**，"
         f"淨欠款 **{round(max_debt)} NTD**\n"
         f"請盡快通過預算！勿債留子孫！！禍延中華民國台灣 🇹🇼"
     )
     await interaction.channel.send(message)
-    await interaction.response.send_message("✅ 已發出公告", ephemeral=True)
+    await interaction.followup.send("✅ 已發出公告", ephemeral=True)
 
 @bot.tree.command(name="結清", description="結清兩人之間的帳務並歸檔")
 async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
+    await interaction.response.defer()
     members = get_members()
     if name1 not in members or name2 not in members:
-        await interaction.response.send_message(f"❌ 名字錯誤！合法名單：{', '.join(members)}", ephemeral=True)
+        await interaction.followup.send(f"❌ 名字錯誤！合法名單：{', '.join(members)}", ephemeral=True)
         return
     n1, n2 = sorted([name1, name2])
     records = load_records()
@@ -897,7 +1014,7 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
         else: remaining.append(r)
 
     if not target:
-        await interaction.response.send_message("🔍 找不到這兩人之間的未結帳目", ephemeral=True)
+        await interaction.followup.send("🔍 找不到這兩人之間的未結帳目", ephemeral=True)
         return
 
     net = {n1: 0.0, n2: 0.0}
@@ -926,78 +1043,12 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     expense_ws.clear()
     expense_ws.update("A1", rows_to_keep)
 
-    await interaction.response.send_message(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
+    await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
-
-# ==================== 設定頻道 Modal ====================
-class SetChannelsModal(discord.ui.Modal, title="設定頻道 ID"):
-    def __init__(self):
-        super().__init__()
-        config = load_config()
-        self.cashier_input = discord.ui.TextInput(
-            label="收銀台頻道 ID",
-            placeholder="右鍵點擊頻道 → 複製頻道 ID",
-            default=str(config.get("cashier_channel_id", "")) if config.get("cashier_channel_id") else ""
-        )
-        self.recovery_input = discord.ui.TextInput(
-            label="餐盤回收區頻道 ID",
-            placeholder="右鍵點擊頻道 → 複製頻道 ID",
-            default=str(config.get("recovery_channel_id", "")) if config.get("recovery_channel_id") else ""
-        )
-        self.add_item(self.cashier_input)
-        self.add_item(self.recovery_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            cashier_id  = int(self.cashier_input.value.strip())
-            recovery_id = int(self.recovery_input.value.strip())
-            config = load_config()
-            config["cashier_channel_id"]  = cashier_id
-            config["recovery_channel_id"] = recovery_id
-            save_config(config)
-            await interaction.response.send_message("✅ 頻道設定完成！", ephemeral=True)
-        except ValueError:
-            await interaction.response.send_message("❌ 頻道 ID 必須是純數字", ephemeral=True)
-
-# ==================== 設定試算表 Modal ====================
-class SetSheetModal(discord.ui.Modal, title="設定 Google Sheet ID"):
-    def __init__(self):
-        super().__init__()
-        self.sheet_input = discord.ui.TextInput(
-            label="Google Sheet ID",
-            placeholder="試算表網址中間那串字"
-        )
-        self.add_item(self.sheet_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        sheet_id = self.sheet_input.value.strip()
-        config = load_config()
-        config["sheet_id"] = sheet_id
-        save_config(config)
-        await interaction.response.send_message("✅ 試算表 ID 設定完成！", ephemeral=True)
-
-# ==================== 查帳 View ====================
-class AccountSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        select = discord.ui.Select(
-            placeholder="選擇要查帳的人",
-            options=[discord.SelectOption(label=m, value=m) for m in get_members()]
-        )
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        name = interaction.data["values"][0]
-        summary = build_account_summary(name)
-        await interaction.response.edit_message(content="✅ 查詢完成！", view=None)
-        await interaction.channel.send(summary)
 
 @bot.event
 async def on_ready():
     print(f"成功登入！機器人：{bot.user}")
-    await update_cashier_board()
 
 keep_alive()
-
 bot.run(os.getenv("DISCORD_TOKEN"))
