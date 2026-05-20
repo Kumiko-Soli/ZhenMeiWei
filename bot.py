@@ -24,7 +24,13 @@ SCOPES = [
 
 # ==================== Google Sheets 連線 ====================
 def get_sheets_client():
-    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    import base64
+    b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+    if b64:
+        creds_json = json.loads(base64.b64decode(b64).decode("utf-8"))
+        creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
     return gspread.authorize(creds)
 
 def get_worksheets():
@@ -991,5 +997,7 @@ class AccountSelectView(discord.ui.View):
 async def on_ready():
     print(f"成功登入！機器人：{bot.user}")
     await update_cashier_board()
+
+keep_alive()
 
 bot.run(os.getenv("DISCORD_TOKEN"))
