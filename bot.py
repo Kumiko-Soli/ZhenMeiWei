@@ -38,6 +38,8 @@ def keep_alive():
 # ==================== Google Sheets 連線 ====================
 _sheets_client = None
 _spreadsheet = None
+_config_cache = None
+_members_cache = None
 
 def get_sheets_client():
     global _sheets_client
@@ -74,6 +76,9 @@ def get_members_ws():
 
 # ==================== 設定檔讀寫（Google Sheets）====================
 def load_config():
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
     try:
         ws = get_config_ws()
         rows = ws.get_all_values()
@@ -85,11 +90,13 @@ def load_config():
                     config[key] = int(value)
                 except ValueError:
                     config[key] = value
-        return config
+        _config_cache = config
+        return _config_cache
     except Exception:
         return {"cashier_channel_id": 0, "recovery_channel_id": 0, "sheet_id": ""}
 
 def save_config(key, value):
+    global _config_cache
     ws = get_config_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -97,11 +104,16 @@ def save_config(key, value):
             continue
         if row and row[0] == key:
             ws.update(f"B{i+1}", [[str(value)]])
+            _config_cache = None  # 清除快取
             return
     ws.append_row([key, str(value)])
+    _config_cache = None  # 清除快取
 
 # ==================== 成員資料讀寫（Google Sheets）====================
 def load_members_data():
+    global _members_cache
+    if _members_cache is not None:
+        return _members_cache
     try:
         ws = get_members_ws()
         rows = ws.get_all_values()
@@ -112,15 +124,19 @@ def load_members_data():
                 members.append(row[0])
                 if len(row) >= 2 and row[1]:
                     discord_map[row[1]] = row[0]
-        return {"members": members, "discord_map": discord_map}
+        _members_cache = {"members": members, "discord_map": discord_map}
+        return _members_cache
     except Exception:
         return {"members": [], "discord_map": {}}
 
 def add_member_to_sheet(name):
+    global _members_cache
     ws = get_members_ws()
     ws.append_row([name, ""])
+    _members_cache = None  # 清除快取
 
 def remove_member_from_sheet(name):
+    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -129,8 +145,10 @@ def remove_member_from_sheet(name):
         if row and row[0] == name:
             ws.delete_rows(i + 1)
             return
+    _members_cache = None  # 清除快取
 
 def set_discord_mapping(name, discord_id):
+    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -139,9 +157,11 @@ def set_discord_mapping(name, discord_id):
         if row and row[0] == name:
             ws.update(f"B{i+1}", [[discord_id]])
             return
+    _members_cache = None  # 清除快取
 
 def rename_member_in_sheets(old_name, new_name):
     # 更新 members 工作表
+    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -149,6 +169,8 @@ def rename_member_in_sheets(old_name, new_name):
             continue
         if row and row[0] == old_name:
             ws.update(f"A{i+1}", [[new_name]])
+            _members_cache = None  # 清除快取
+    _members_cache = None  # 清除快取
 
     # 更新 expense 和 history 工作表
     expense_ws, history_ws = get_worksheets()
