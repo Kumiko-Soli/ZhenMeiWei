@@ -1,0 +1,7 @@
+.env
+credentials.json
+members.json
+config.json
+expense_v2.csv
+history.csv
+__pycache__/
