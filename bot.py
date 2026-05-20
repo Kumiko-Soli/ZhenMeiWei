@@ -36,24 +36,31 @@ def keep_alive():
     t.start()
 
 # ==================== Google Sheets 連線 ====================
+_sheets_client = None
+_spreadsheet = None
+
 def get_sheets_client():
+    global _sheets_client
+    if _sheets_client is not None:
+        return _sheets_client
     b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
     if b64:
         creds_json = json.loads(base64.b64decode(b64).decode("utf-8"))
         creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
     else:
         creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-    return gspread.authorize(creds)
+    _sheets_client = gspread.authorize(creds)
+    return _sheets_client
 
 def get_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "")
     if not sheet_id:
-        # 嘗試從 config 工作表讀取
-        client = get_sheets_client()
-        # 無法讀取，拋出錯誤
         raise ValueError("尚未設定 GOOGLE_SHEET_ID 環境變數")
-    client = get_sheets_client()
-    return client.open_by_key(sheet_id)
+    _spreadsheet = get_sheets_client().open_by_key(sheet_id)
+    return _spreadsheet
 
 def get_worksheets():
     ss = get_spreadsheet()
