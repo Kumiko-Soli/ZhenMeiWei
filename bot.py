@@ -285,6 +285,84 @@ def format_rate(rate):
     decimal_places = max(0, 4 - int_digits)
     return f"{rate:.{decimal_places}f}"
 
+# ==================== 餐盤回收區排版繪製邏輯 ====================
+async def update_recovery_board():
+    config = load_config()
+    channel = bot.get_channel(config.get("recovery_channel_id", 0))
+    if not channel:
+        print(f"❌ 找不到餐盤回收區頻道")
+        return
+
+    try:
+        await channel.purge(limit=100)
+    except Exception as e:
+        print(f"⚠️ 自動清空失敗: {e}")
+        async for message in channel.history(limit=50):
+            try: await message.delete()
+            except: pass
+
+    try:
+        history_ws = get_spreadsheet().worksheet("history")
+        rows = history_ws.get_all_values()
+        records = []
+        for row in rows[1:]:
+            if row and row[0]:
+                records.append({
+                    "id":           int(row[0]),
+                    "record_time":  row[1],
+                    "clear_time":   row[2],
+                    "debtor":       row[3],
+                    "creditor":     row[4],
+                    "amount":       float(row[5]),
+                    "rate":         float(row[6]),
+                    "item":         row[7]
+                })
+    except Exception as e:
+        await channel.send(f"❌ 讀取歷史資料失敗：{e}")
+        return
+
+    if not records:
+        await channel.send("✨ 目前尚無任何結清紀錄！")
+        return
+
+    records = sorted(records, key=lambda x: x["id"])
+
+    pair_groups = {}
+    for r in records:
+        p1, p2 = sorted([r["debtor"], r["creditor"]])
+        pair_key = f"{p1} vs {p2}"
+        if pair_key not in pair_groups: pair_groups[pair_key] = []
+        pair_groups[pair_key].append(r)
+
+    for pair_key, group_records in pair_groups.items():
+        p1, p2 = pair_key.split(" vs ")
+
+        table_lines = []
+        table_lines.append(f"```\n{pair_key}")
+        table_lines.append("-" * 62)
+        table_lines.append("|編號||欠債人||債權人||金額||匯率||時間|    |項目|")
+
+        for r in group_records:
+            amt_str  = str(int(r['amount'])) if r['amount'].is_integer() else str(r['amount'])
+            rate_str = format_rate(r['rate'])
+            # 結清時間取前8位數字，去掉橫線
+            clear_date = r['clear_time'].replace("-", "").replace(" ", "")[:8]
+
+            c_id       = align_text(f"{r['id']:03d}", 6, 'center')
+            c_debtor   = align_text(r['debtor'],      6, 'center')
+            c_creditor = align_text(r['creditor'],    6, 'center')
+            c_amount   = " " + align_text(amt_str[:4], 4, 'left')
+            c_rate     = align_text(rate_str[:5],     5, 'left')
+            c_date     = f" {clear_date}"
+
+            raw_item = r["item"][:12] + ".." if len(r["item"]) > 12 else r["item"]
+            c_item   = f"    {raw_item}"
+
+            table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
+
+        table_lines.append("-" * 62 + "```")
+        await channel.send("\n".join(table_lines))
+
 # ==================== 收銀台排版繪製邏輯 ====================
 async def update_cashier_board():
     config = load_config()
@@ -359,15 +437,20 @@ async def update_cashier_board():
 # ==================== 查帳彙總邏輯 ====================
 def build_account_summary(name):
     records = load_records()
-    owe_others = {}
-    others_owe = {}
+    # 計算與每個人之間的淨額（正數代表 name 欠對方，負數代表對方欠 name）
+    net_with = {}
 
     for r in records:
         amount_ntd = r["amount"] * r["rate"]
         if r["debtor"] == name:
-            owe_others[r["creditor"]] = owe_others.get(r["creditor"], 0) + amount_ntd
+            other = r["creditor"]
+            net_with[other] = net_with.get(other, 0) + amount_ntd
         elif r["creditor"] == name:
-            others_owe[r["debtor"]] = others_owe.get(r["debtor"], 0) + amount_ntd
+            other = r["debtor"]
+            net_with[other] = net_with.get(other, 0) - amount_ntd
+
+    owe_others = {p: amt for p, amt in net_with.items() if amt > 0}
+    others_owe = {p: -amt for p, amt in net_with.items() if amt < 0}
 
     lines = [f"📊 **{name} 的帳務彙總**", "─" * 24]
 
@@ -896,8 +979,16 @@ class SetSheetModal(discord.ui.Modal, title="設定 Google Sheet ID"):
         await interaction.followup.send("✅ 試算表 ID 設定完成！", ephemeral=True)
 
 # ==================== 斜線指令系統 ====================
+async def member_autocomplete(interaction: discord.Interaction, current: str):
+    members = get_members()
+    return [
+        app_commands.Choice(name=m, value=m)
+        for m in members if current.lower() in m.lower()
+    ][:25]
+
 @bot.tree.command(name="記帳", description="快速新增記帳 (直接按 Tab 填寫，電腦端推薦)")
 @app_commands.describe(debtor="欠債人", creditor="債權人", amount="金額", rate="匯率", item="項目")
+@app_commands.autocomplete(debtor=member_autocomplete, creditor=member_autocomplete)
 async def slash_record(interaction: discord.Interaction, debtor: str, creditor: str, amount: float, rate: float, item: str):
     members = get_members()
     if debtor not in members or creditor not in members:
@@ -983,7 +1074,8 @@ async def slash_purge(interaction: discord.Interaction):
 async def slash_refresh(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await update_cashier_board()
-    await interaction.followup.send("✅ 收銀台已更新完畢！", ephemeral=True)
+    await update_recovery_board()
+    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！", ephemeral=True)
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
@@ -1029,6 +1121,8 @@ async def slash_blue_white(interaction: discord.Interaction):
     await interaction.followup.send("✅ 已發出公告", ephemeral=True)
 
 @bot.tree.command(name="結清", description="結清兩人之間的帳務並歸檔")
+@app_commands.describe(name1="第一個人", name2="第二個人")
+@app_commands.autocomplete(name1=member_autocomplete, name2=member_autocomplete)
 async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     await interaction.response.defer()
     members = get_members()
@@ -1057,9 +1151,6 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     subtotal = "雙方平手" if round(diff)==0 else (f"{n1} 支付 {round(diff)} NTD 給 {n2}" if diff>0 else f"{n2} 支付 {round(abs(diff))} NTD 給 {n1}")
     recovery.extend(["-" * 30, f"📊 **小計：{subtotal}**"])
 
-    config = load_config()
-    recv_channel = bot.get_channel(config.get("recovery_channel_id", 0))
-    if recv_channel: await recv_channel.send("\n".join(recovery))
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _, history_ws = get_worksheets()
@@ -1072,6 +1163,29 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     rows_to_keep = [all_rows[0]] + [row for row in all_rows[1:] if row and int(row[0]) not in target_ids]
     expense_ws.clear()
     expense_ws.update("A1", rows_to_keep)
+
+    config = load_config()
+    recv_channel = bot.get_channel(config.get("recovery_channel_id", 0))
+    if recv_channel:
+        now_date = datetime.now().strftime("%Y%m%d")
+        table_lines = []
+        table_lines.append(f"```\n{n1} vs {n2}")
+        table_lines.append("-" * 62)
+        table_lines.append("|編號||欠債人||債權人||金額||匯率||時間|    |項目|")
+        for r in target:
+            amt_str  = str(int(r['amount'])) if r['amount'].is_integer() else str(r['amount'])
+            rate_str = format_rate(r['rate'])
+            c_id       = align_text(f"{r['id']:03d}", 6, 'center')
+            c_debtor   = align_text(r['debtor'],      6, 'center')
+            c_creditor = align_text(r['creditor'],    6, 'center')
+            c_amount   = " " + align_text(amt_str[:4], 4, 'left')
+            c_rate     = align_text(rate_str[:5],     5, 'left')
+            c_date     = f" {now_date}"
+            raw_item = r["item"][:12] + ".." if len(r["item"]) > 12 else r["item"]
+            c_item   = f"    {raw_item}"
+            table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
+        table_lines.append("-" * 62 + "```")
+        await recv_channel.send("\n".join(table_lines))
 
     await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
