@@ -361,7 +361,20 @@ async def update_recovery_board():
             table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
 
         table_lines.append("-" * 62 + "```")
-        await channel.send("\n".join(table_lines))
+        
+        # 分批發送，每批不超過 1900 字元（留buffer）
+        current_msg = ""
+        header = f"```\n{pair_key}\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||金額||匯率||時間|    |項目|\n"
+        current_msg = header
+        
+        for line in table_lines[3:-1]:  # 跳過標題、分隔線、標頭、結尾分隔線
+            test_msg = current_msg + line + "\n"
+            if len(test_msg) > 1800:
+                await channel.send(current_msg + "-" * 62 + "```")
+                current_msg = header
+            current_msg += line + "\n"
+        
+        await channel.send(current_msg + "-" * 62 + "```")
 
 # ==================== 收銀台排版繪製邏輯 ====================
 async def update_cashier_board():
@@ -1185,7 +1198,19 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
             c_item   = f"    {raw_item}"
             table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
         table_lines.append("-" * 62 + "```")
-        await recv_channel.send("\n".join(table_lines))
+        
+        # 分批發送，每批不超過 1800 字元
+        header = f"```\n{n1} vs {n2}\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||金額||匯率||時間|    |項目|\n"
+        current_msg = header
+        
+        for line in table_lines[3:-1]:
+            test_msg = current_msg + line + "\n"
+            if len(test_msg) > 1800:
+                await recv_channel.send(current_msg + "-" * 62 + "```")
+                current_msg = header
+            current_msg += line + "\n"
+        
+        await recv_channel.send(current_msg + "-" * 62 + "```")
 
     await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
