@@ -337,43 +337,33 @@ async def update_recovery_board():
     for pair_key, group_records in pair_groups.items():
         p1, p2 = pair_key.split(" vs ")
 
-        table_lines = []
-        table_lines.append(f"```\n{pair_key}")
-        table_lines.append("-" * 62)
-        table_lines.append("|編號||欠債人||債權人||金額||匯率||時間|    |項目|")
-
+        data_lines = []
         for r in group_records:
-            amt_str  = str(int(r['amount'])) if r['amount'].is_integer() else str(r['amount'])
-            rate_str = format_rate(r['rate'])
-            # 結清時間取前8位數字，去掉橫線
-            clear_date = r['clear_time'].replace("-", "").replace(" ", "")[:8]
+            ntd = math.ceil(r['amount'] * r['rate'])
+            ntd_str = str(ntd)
+            clear_date = r['clear_time'].replace("-", "").replace(" ", "")[2:8]
 
             c_id       = align_text(f"{r['id']:03d}", 6, 'center')
             c_debtor   = align_text(r['debtor'],      6, 'center')
-            c_creditor = align_text(r['creditor'],    6, 'center')
-            c_amount   = " " + align_text(amt_str[:4], 4, 'left')
-            c_rate     = align_text(rate_str[:5],     5, 'left')
-            c_date     = f" {clear_date}"
+            c_creditor = align_text(r['creditor'],    8, 'center')
+            c_ntd      = " " + align_text(ntd_str[:5], 6, 'left')
+            c_date     = f"{clear_date}"
 
             raw_item = r["item"][:12] + ".." if len(r["item"]) > 12 else r["item"]
-            c_item   = f"    {raw_item}"
+            c_item   = f" {raw_item}"
+            data_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_ntd}{c_date}{c_item}")
 
-            table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
-
-        table_lines.append("-" * 62 + "```")
-        
-        # 分批發送，每批不超過 1900 字元（留buffer）
-        current_msg = ""
-        header = f"```\n{pair_key}\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||金額||匯率||時間|    |項目|\n"
+        # 分批發送
+        header = "```\n" + pair_key + "\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||料金| |時間| |項目|\n"
         current_msg = header
-        
-        for line in table_lines[3:-1]:  # 跳過標題、分隔線、標頭、結尾分隔線
-            test_msg = current_msg + line + "\n"
+
+        for line in data_lines:
+            test_msg = current_msg + line + "\n" + "-" * 62 + "```"
             if len(test_msg) > 1800:
                 await channel.send(current_msg + "-" * 62 + "```")
                 current_msg = header
             current_msg += line + "\n"
-        
+
         await channel.send(current_msg + "-" * 62 + "```")
 
 # ==================== 收銀台排版繪製邏輯 ====================
@@ -1083,7 +1073,7 @@ async def slash_purge(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ 清空失敗。原因：{e}", ephemeral=True)
 
-@bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台表格")
+@bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台/餐盤回收區表格")
 async def slash_refresh(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await update_cashier_board()
@@ -1180,27 +1170,28 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     config = load_config()
     recv_channel = bot.get_channel(config.get("recovery_channel_id", 0))
     if recv_channel:
-        now_date = datetime.now().strftime("%Y%m%d")
+        now_date = datetime.now().strftime("%y%m%d")
         table_lines = []
         table_lines.append(f"```\n{n1} vs {n2}")
         table_lines.append("-" * 62)
-        table_lines.append("|編號||欠債人||債權人||金額||匯率||時間|    |項目|")
+        table_lines.append("|編號||欠債人||債權人||料金||時間|    |項目|")
         for r in target:
             amt_str  = str(int(r['amount'])) if r['amount'].is_integer() else str(r['amount'])
             rate_str = format_rate(r['rate'])
             c_id       = align_text(f"{r['id']:03d}", 6, 'center')
             c_debtor   = align_text(r['debtor'],      6, 'center')
             c_creditor = align_text(r['creditor'],    6, 'center')
-            c_amount   = " " + align_text(amt_str[:4], 4, 'left')
-            c_rate     = align_text(rate_str[:5],     5, 'left')
+            ntd = math.ceil(r['amount'] * r['rate'])
+            ntd_str = str(ntd)
+            c_ntd      = " " + align_text(ntd_str[:5], 5, 'left')
             c_date     = f" {now_date}"
             raw_item = r["item"][:12] + ".." if len(r["item"]) > 12 else r["item"]
             c_item   = f"    {raw_item}"
-            table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_amount}{c_rate}{c_date}{c_item}")
+            table_lines.append(f"{c_id}{c_debtor}{c_creditor}{c_ntd}{c_date}{c_item}")
         table_lines.append("-" * 62 + "```")
         
         # 分批發送，每批不超過 1800 字元
-        header = f"```\n{n1} vs {n2}\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||金額||匯率||時間|    |項目|\n"
+        header = f"```\n{n1} vs {n2}\n" + "-" * 62 + "\n" + "|編號||欠債人||債權人||料金||時間|    |項目|\n"
         current_msg = header
         
         for line in table_lines[3:-1]:
