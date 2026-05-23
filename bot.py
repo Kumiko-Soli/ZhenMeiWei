@@ -1103,7 +1103,7 @@ async def slash_blue_white(interaction: discord.Interaction):
 
     max_debt = max(net.values()) if net else 0
     if max_debt <= 0:
-        await interaction.channel.send("🎉 本群目前人人清白，無人欠債！")
+        await interaction.channel.send("🎉 本群目前清清白白，無人收錢！")
         await interaction.followup.send("✅ 已發出公告", ephemeral=True)
         return
 
