@@ -1123,6 +1123,43 @@ async def slash_blue_white(interaction: discord.Interaction):
     await interaction.channel.send(message)
     await interaction.followup.send("✅ 已發出公告", ephemeral=True)
 
+@bot.tree.command(name="林佳龍", description="心疼本群最大債主！")
+async def slash_lin(interaction: discord.Interaction):
+    await interaction.response.defer()
+    records = load_records()
+    members = get_members()
+    net = {m: 0.0 for m in members}
+    for r in records:
+        amount_ntd = r["amount"] * r["rate"]
+        if r["debtor"] in net:
+            net[r["debtor"]] += amount_ntd
+        if r["creditor"] in net:
+            net[r["creditor"]] -= amount_ntd
+
+    # 最大債主 = 淨額最小（最負）的人
+    min_debt = min(net.values()) if net else 0
+    if min_debt >= 0:
+        await interaction.channel.send("🤷 本群目前沒有人是債主！")
+        await interaction.followup.send("✅ 已發出公告", ephemeral=True)
+        return
+
+    top_creditors = [name for name, amt in net.items() if amt == min_debt]
+    data = load_members_data()
+    name_to_id = {v: k for k, v in data["discord_map"].items()}
+    mentions = []
+    for name in top_creditors:
+        discord_id = name_to_id.get(name)
+        mentions.append(f"<@{discord_id}>（{name}）" if discord_id else name)
+
+    target_str = "、".join(mentions)
+    message = (
+        f"💰 **本群最大債主是 {target_str}**，"
+        f"淨借出 **{round(abs(min_debt))} NTD**\n"
+        f"心疼 {target_str}，大家都欠他一個道歉，台中人不值得他 🥲"
+    )
+    await interaction.channel.send(message)
+    await interaction.followup.send("✅ 已發出公告", ephemeral=True)
+
 @bot.tree.command(name="結清", description="結清兩人之間的帳務並歸檔")
 @app_commands.describe(name1="第一個人", name2="第二個人")
 @app_commands.autocomplete(name1=member_autocomplete, name2=member_autocomplete)
