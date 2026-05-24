@@ -11,6 +11,8 @@ from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
+from discord.ext import tasks
+import pytz
 
 load_dotenv()
 
@@ -1123,6 +1125,19 @@ async def slash_blue_white(interaction: discord.Interaction):
     await interaction.channel.send(message)
     await interaction.followup.send("✅ 已發出公告", ephemeral=True)
 
+@bot.tree.command(name="測試匯率", description="測試匯率查詢")
+async def slash_test_rate(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.frankfurter.app/latest?from=JPY&to=TWD") as resp:
+                data = await resp.json()
+                rate = data["rates"]["TWD"]
+        await interaction.followup.send(f"✅ 目前匯率：1 JPY = {rate:.4f} TWD", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 查詢失敗：{e}", ephemeral=True)
+
 @bot.tree.command(name="林佳龍", description="心疼本群最大債主！")
 async def slash_lin(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -1243,9 +1258,56 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
 
+# ==================== 每日匯率通知 ====================
+NOTIFY_CHANNEL_ID = 472053843367297026
+JPY_THRESHOLD = 0.200
+
+@tasks.loop(time=datetime.time(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
+async def daily_rate_check():
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.frankfurter.app/latest?from=JPY&to=TWD") as resp:
+                data = await resp.json()
+                rate = data["rates"]["TWD"]
+        
+        if rate < JPY_THRESHOLD:
+            channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+            if channel:
+                await channel.send(
+                    f"💴 **現在日幣匯率：1 JPY = {rate:.4f} TWD**\n"
+                    f"現在日幣正划算，老師們快換日幣吧，替老師精打細算也是我的工作呢 📊"
+                )
+    except Exception as e:
+        print(f"⚠️ 匯率查詢失敗：{e}")
+
+# ==================== 關鍵字偵測 ====================
+ROLE_ID = 937360224493396018
+KEYWORDS = ["我請大家", "我請客", "請大家吃"]
+
+@bot.event
+async def on_message(message: discord.Message):
+    # 忽略機器人自己的訊息
+    if message.author.bot:
+        return
+
+    # 檢查是否包含關鍵字
+    if any(kw in message.content for kw in KEYWORDS):
+        role = message.guild.get_role(ROLE_ID)
+        if role:
+            await message.channel.send(f"🍽️ 有人要請客！{role.mention} 快來！")
+        try:
+            await message.pin()
+        except Exception as e:
+            print(f"⚠️ 釘選失敗：{e}")
+
+    # 確保其他指令正常運作
+    await bot.process_commands(message)
+
 @bot.event
 async def on_ready():
     print(f"成功登入！機器人：{bot.user}")
+    daily_rate_check.start()
 
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))

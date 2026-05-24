@@ -3,3 +3,5 @@ gspread
 google-auth
 python-dotenv
 flask
+pytz
+aiohttp
