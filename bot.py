@@ -1261,7 +1261,7 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
 
 # ==================== 每日匯率通知 ====================
 NOTIFY_CHANNEL_ID = 472053843367297026
-JPY_THRESHOLD = 0.200
+JPY_THRESHOLD = 0.198
 
 @tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
 async def daily_rate_check():
