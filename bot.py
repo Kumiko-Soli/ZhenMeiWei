@@ -13,6 +13,7 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 from discord.ext import tasks
 import pytz
+from datetime import time as dtime
 
 load_dotenv()
 
@@ -1262,7 +1263,7 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
 NOTIFY_CHANNEL_ID = 472053843367297026
 JPY_THRESHOLD = 0.200
 
-@tasks.loop(time=datetime.time(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
+@tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
 async def daily_rate_check():
     try:
         import aiohttp
