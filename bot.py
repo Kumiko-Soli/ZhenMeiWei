@@ -1132,9 +1132,10 @@ async def slash_test_rate(interaction: discord.Interaction):
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.frankfurter.app/latest?from=JPY&to=TWD") as resp:
+            async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
                 data = await resp.json()
-                await interaction.followup.send(f"回傳資料：{data}", ephemeral=True)
+                rate = data["rates"]["TWD"]
+                await interaction.followup.send(f"✅ 目前匯率：1 JPY = {rate:.4f} TWD", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 查詢失敗：{e}", ephemeral=True)
 
@@ -1267,7 +1268,7 @@ async def daily_rate_check():
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.frankfurter.app/latest?from=JPY&to=TWD") as resp:
+            async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
                 data = await resp.json()
                 rate = data["rates"]["TWD"]
         
