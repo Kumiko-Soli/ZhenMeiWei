@@ -2,6 +2,8 @@ import os
 import math
 import json
 import base64
+import random
+import re
 from datetime import datetime
 from flask import Flask
 from threading import Thread
@@ -43,6 +45,9 @@ _sheets_client = None
 _spreadsheet = None
 _config_cache = None
 _members_cache = None
+_triggers_cache = None
+
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
 def get_sheets_client():
     global _sheets_client
@@ -76,6 +81,9 @@ def get_config_ws():
 
 def get_members_ws():
     return get_spreadsheet().worksheet("members")
+
+def get_triggers_ws():
+    return get_spreadsheet().worksheet("triggers")
 
 # ==================== 設定檔讀寫（Google Sheets）====================
 def load_config():
@@ -189,6 +197,59 @@ def rename_member_in_sheets(old_name, new_name):
 def get_members():
     return load_members_data()["members"]
 
+# ==================== 觸發詞資料讀寫（Google Sheets）====================
+def load_triggers():
+    global _triggers_cache
+    if _triggers_cache is not None:
+        return _triggers_cache
+    try:
+        ws = get_triggers_ws()
+        rows = ws.get_all_values()
+        triggers = []
+        for row in rows[1:]:
+            if row and row[0]:
+                triggers.append({
+                    "id":            int(row[0]),
+                    "keyword":       row[1] if len(row) > 1 else "",
+                    "response_text": row[2] if len(row) > 2 else "",
+                    "image_url":     row[3] if len(row) > 3 else "",
+                    "mention_name":  row[4] if len(row) > 4 else "",
+                    "match_type":    row[5] if len(row) > 5 and row[5] else "contains",
+                    "reply_type":    row[6] if len(row) > 6 and row[6] else "new",
+                    "probability":   int(row[7]) if len(row) > 7 and row[7].isdigit() else 100,
+                })
+        _triggers_cache = triggers
+        return _triggers_cache
+    except Exception:
+        return []
+
+def get_trigger_next_id():
+    ws = get_triggers_ws()
+    rows = ws.get_all_values()
+    ids = [int(row[0]) for row in rows[1:] if row and row[0].isdigit()]
+    return max(ids) + 1 if ids else 1
+
+def add_trigger(keyword, response_text, image_url, mention_name, match_type="contains", reply_type="new", probability=100):
+    global _triggers_cache
+    ws = get_triggers_ws()
+    next_id = get_trigger_next_id()
+    ws.append_row([next_id, keyword, response_text, image_url, mention_name, match_type, reply_type, probability])
+    _triggers_cache = None
+    return next_id
+
+def delete_trigger_by_id(trigger_id):
+    global _triggers_cache
+    ws = get_triggers_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(trigger_id):
+            ws.delete_rows(i + 1)
+            _triggers_cache = None
+            return True
+    return False
+
 # ==================== Bot 設定 ====================
 class MyBot(commands.Bot):
     def __init__(self):
@@ -201,6 +262,23 @@ class MyBot(commands.Bot):
         print(f"✅ 斜線指令同步請求已送出")
 
 bot = MyBot()
+
+# ==================== Imgur 圖片上傳 ====================
+async def upload_to_imgbb(attachment: discord.Attachment) -> str:
+    """下載 Discord 附件並上傳至 imgbb，回傳永久直連 URL。失敗時拋出例外。"""
+    if not IMGBB_API_KEY:
+        raise ValueError("尚未設定 IMGBB_API_KEY 環境變數")
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        async with session.get(attachment.url) as resp:
+            image_data = await resp.read()
+        encoded = base64.b64encode(image_data).decode("utf-8")
+        payload = {"key": IMGBB_API_KEY, "image": encoded}
+        async with session.post("https://api.imgbb.com/1/upload", data=payload) as resp:
+            result = await resp.json()
+            if not result.get("success"):
+                raise RuntimeError(f"imgbb 上傳失敗：{result}")
+            return result["data"]["url"]
 
 # ==================== 核心資料處理函式 ====================
 def get_next_id(expense_ws):
@@ -1078,10 +1156,12 @@ async def slash_purge(interaction: discord.Interaction):
 
 @bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台/餐盤回收區表格")
 async def slash_refresh(interaction: discord.Interaction):
+    global _triggers_cache
     await interaction.response.defer(ephemeral=True)
+    _triggers_cache = None
     await update_cashier_board()
     await update_recovery_board()
-    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！", ephemeral=True)
+    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！觸發詞快取也已清除。", ephemeral=True)
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
@@ -1259,6 +1339,188 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
 
+# ==================== 新增觸發詞 View + Modal ====================
+class AddTriggerView(discord.ui.View):
+    def __init__(self, image_url: str = ""):
+        super().__init__(timeout=120)
+        self.image_url  = image_url
+        self.match_type = "contains"
+        self.reply_type = "new"
+
+        match_select = discord.ui.Select(
+            placeholder="觸發方式",
+            options=[
+                discord.SelectOption(label="包含（訊息包含關鍵詞）",       value="contains", default=True),
+                discord.SelectOption(label="完全相符（整句等於關鍵詞）",   value="exact"),
+                discord.SelectOption(label="正則 Regex（如 彰.+人）",       value="regex"),
+            ]
+        )
+        match_select.callback = self.match_callback
+        self.add_item(match_select)
+
+        reply_select = discord.ui.Select(
+            placeholder="回覆方式",
+            options=[
+                discord.SelectOption(label="新訊息（獨立發送）",         value="new", default=True),
+                discord.SelectOption(label="回覆該則（引用箭頭）",       value="reply"),
+            ]
+        )
+        reply_select.callback = self.reply_callback
+        self.add_item(reply_select)
+
+    async def match_callback(self, interaction: discord.Interaction):
+        self.match_type = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def reply_callback(self, interaction: discord.Interaction):
+        self.reply_type = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=2)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            AddTriggerModal(self.match_type, self.reply_type, self.image_url)
+        )
+
+class AddTriggerModal(discord.ui.Modal, title="新增觸發詞"):
+    def __init__(self, match_type: str, reply_type: str, image_url: str):
+        super().__init__()
+        self.match_type = match_type
+        self.reply_type = reply_type
+        self.image_url  = image_url
+        self.keyword_input  = discord.ui.TextInput(label="觸發關鍵詞", placeholder="例：彰化　或 Regex：彰.+人")
+        self.response_input = discord.ui.TextInput(
+            label="回覆文字（<> 分隔多個選項，選填）",
+            placeholder="例：彥丞道歉<>彰化人不行<>又是你",
+            required=False, style=discord.TextStyle.paragraph
+        )
+        self.mention_input  = discord.ui.TextInput(label="要 @ 的成員名（選填）", placeholder="例：彥丞", required=False)
+        self.prob_input     = discord.ui.TextInput(
+            label="觸發機率 0–100（多觸發詞競爭時的權重）",
+            placeholder="預設 100", default="100", required=False
+        )
+        self.add_item(self.keyword_input)
+        self.add_item(self.response_input)
+        self.add_item(self.mention_input)
+        self.add_item(self.prob_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        keyword      = self.keyword_input.value.strip()
+        response_text = self.response_input.value.strip()
+        mention      = self.mention_input.value.strip()
+        try:
+            prob = int(self.prob_input.value.strip() or "100")
+            if not 0 <= prob <= 100: raise ValueError
+        except ValueError:
+            await interaction.followup.send("❌ 機率必須是 0–100 的整數", ephemeral=True)
+            return
+        members = get_members()
+        if mention and mention not in members:
+            await interaction.followup.send(f"❌ 找不到成員「{mention}」，合法名單：{', '.join(members)}", ephemeral=True)
+            return
+        if not response_text and not self.image_url and not mention:
+            await interaction.followup.send("❌ 請至少填寫回覆文字、圖片或 @ 成員其中一項", ephemeral=True)
+            return
+        new_id = add_trigger(keyword, response_text, self.image_url, mention, self.match_type, self.reply_type, prob)
+        ml = {"contains": "包含", "exact": "完全相符", "regex": "正則"}.get(self.match_type, self.match_type)
+        rl = {"new": "新訊息", "reply": "回覆該則"}.get(self.reply_type, self.reply_type)
+        parts = [f"✅ **[{new_id:03d}] 觸發詞「{keyword}」新增成功！**",
+                 f"　觸發方式：{ml}　回覆方式：{rl}　機率：{prob}"]
+        if mention:        parts.append(f"　@ {mention}")
+        if response_text:  parts.append(f"　文字：{response_text[:50]}{'...' if len(response_text) > 50 else ''}")
+        if self.image_url: parts.append(f"　圖片：{self.image_url}")
+        await interaction.followup.send("\n".join(parts), ephemeral=True)
+
+# ==================== 觸發詞管理指令 ====================
+def build_triggers_display():
+    triggers = load_triggers()
+    if not triggers:
+        return "（尚無任何觸發詞）"
+    lines = ["⚡ **觸發詞列表**", "─" * 24]
+    mt_labels = {"contains": "包含", "exact": "完全相符", "regex": "正則"}
+    rt_labels = {"new": "新訊息", "reply": "回覆該則"}
+    for t in triggers:
+        preview_text    = f"　文字：{t['response_text'][:20]}{'...' if len(t['response_text']) > 20 else ''}" if t["response_text"] else ""
+        preview_img     = "　🖼️ 含圖片" if t["image_url"] else ""
+        preview_mention = f"　@ {t['mention_name']}" if t["mention_name"] else ""
+        ml = mt_labels.get(t["match_type"], t["match_type"])
+        rl = rt_labels.get(t["reply_type"], t["reply_type"])
+        meta = f"　[{ml} / {rl} / {t['probability']}%]"
+        lines.append(f"**[{t['id']:03d}]** `{t['keyword']}`{preview_mention}{preview_text}{preview_img}{meta}")
+    return "\n".join(lines)
+
+class TriggerManageView(discord.ui.View):
+    def __init__(self, is_admin: bool):
+        super().__init__(timeout=120)
+        if not is_admin:
+            self.remove_item(self.delete_trigger)
+
+    @discord.ui.button(label="刪除觸發詞", style=discord.ButtonStyle.danger)
+    async def delete_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
+        triggers = load_triggers()
+        if not triggers:
+            await interaction.response.send_message("⚠️ 目前沒有觸發詞可刪除。", ephemeral=True)
+            return
+        options = [
+            discord.SelectOption(label=f"[{t['id']:03d}] {t['keyword']}", value=str(t["id"]))
+            for t in triggers
+        ][:25]
+        await interaction.response.send_message(
+            "請選擇要刪除的觸發詞：",
+            view=TriggerDeleteSelectView(options),
+            ephemeral=True
+        )
+
+class TriggerDeleteSelectView(discord.ui.View):
+    def __init__(self, options):
+        super().__init__(timeout=60)
+        select = discord.ui.Select(placeholder="選擇觸發詞", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        tid = int(interaction.data["values"][0])
+        if delete_trigger_by_id(tid):
+            await interaction.response.edit_message(content=f"✅ 已刪除觸發詞 [{tid:03d}]", view=None)
+        else:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {tid:03d}", view=None)
+
+@bot.tree.command(name="觸發詞", description="查看所有觸發詞（管理員可刪除）")
+async def slash_triggers(interaction: discord.Interaction):
+    is_admin = interaction.user.guild_permissions.administrator
+    content  = build_triggers_display()
+    view     = TriggerManageView(is_admin)
+    await interaction.response.send_message(content=content, view=view, ephemeral=True)
+
+@bot.tree.command(name="新增觸發詞", description="新增關鍵字觸發回應（管理員）")
+@app_commands.describe(image="附上圖片自動上傳 imgbb（選填）")
+async def slash_add_trigger(interaction: discord.Interaction, image: discord.Attachment = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    image_url = ""
+    if image:
+        try:
+            image_url = await upload_to_imgbb(image)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 圖片上傳失敗：{e}", ephemeral=True)
+            return
+    await interaction.followup.send("⚡ **新增觸發詞** — 請選擇觸發方式與回覆方式，再按下一步：",
+                                    view=AddTriggerView(image_url), ephemeral=True)
+
+@bot.tree.command(name="刪除觸發詞", description="依編號刪除觸發詞（管理員）")
+async def slash_delete_trigger(interaction: discord.Interaction, 編號: int):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if delete_trigger_by_id(編號):
+        await interaction.followup.send(f"🗑️ 已刪除觸發詞 [{編號:03d}]", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ 找不到編號 {編號:03d}", ephemeral=True)
+
 # ==================== 每日匯率通知 ====================
 NOTIFY_CHANNEL_ID = 472053843367297026
 JPY_THRESHOLD = 0.198
@@ -1301,6 +1563,49 @@ async def on_message(message: discord.Message):
             await message.pin()
         except Exception as e:
             print(f"⚠️ 釘選失敗：{e}")
+
+    # 動態觸發詞偵測
+    try:
+        triggers = load_triggers()
+        data = load_members_data()
+        name_to_id = {v: k for k, v in data["discord_map"].items()}
+        content_lower = message.content.lower()
+
+        matched = {}
+        for trigger in triggers:
+            mt = trigger["match_type"]
+            kw = trigger["keyword"]
+            if mt == "exact":
+                hit = content_lower.strip() == kw.lower().strip()
+            elif mt == "regex":
+                try: hit = bool(re.search(kw, message.content, re.IGNORECASE))
+                except re.error: hit = False
+            else:
+                hit = kw.lower() in content_lower
+            if hit:
+                matched.setdefault(f"{kw}|{mt}", []).append(trigger)
+
+        for candidates in matched.values():
+            weights = [t["probability"] for t in candidates]
+            trigger = random.choices(candidates, weights=weights, k=1)[0]
+            parts = []
+            if trigger["mention_name"]:
+                discord_id = name_to_id.get(trigger["mention_name"])
+                parts.append(f"<@{discord_id}>" if discord_id else trigger["mention_name"])
+            if trigger["response_text"]:
+                options = [o.strip() for o in trigger["response_text"].split("<>") if o.strip()]
+                if options:
+                    parts.append(random.choice(options))
+            if trigger["image_url"]:
+                parts.append(trigger["image_url"])
+            if parts:
+                content = "\n".join(parts)
+                if trigger["reply_type"] == "reply":
+                    await message.reply(content)
+                else:
+                    await message.channel.send(content)
+    except Exception as e:
+        print(f"⚠️ 觸發詞偵測失敗：{e}")
 
     # 確保其他指令正常運作
     await bot.process_commands(message)
