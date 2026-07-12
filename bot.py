@@ -46,6 +46,7 @@ _spreadsheet = None
 _config_cache = None
 _members_cache = None
 _triggers_cache = None
+_reminders_cache = None
 
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
@@ -84,6 +85,9 @@ def get_members_ws():
 
 def get_triggers_ws():
     return get_spreadsheet().worksheet("triggers")
+
+def get_reminders_ws():
+    return get_spreadsheet().worksheet("reminders")
 
 # ==================== 設定檔讀寫（Google Sheets）====================
 def load_config():
@@ -250,6 +254,70 @@ def delete_trigger_by_id(trigger_id):
             return True
     return False
 
+def load_reminders():
+    global _reminders_cache
+    if _reminders_cache is not None:
+        return _reminders_cache
+    try:
+        ws = get_reminders_ws()
+        rows = ws.get_all_values()
+        reminders = []
+        for row in rows[1:]:
+            if row and row[0]:
+                reminders.append({
+                    "id": int(row[0]),
+                    "content": row[1] if len(row) > 1 else "",
+                    "mention_name": row[2] if len(row) > 2 else "",
+                    "hour": int(row[3]) if len(row) > 3 and row[3].isdigit() else 9,
+                    "minute": int(row[4]) if len(row) > 4 and row[4].isdigit() else 0,
+                    "created_by": row[5] if len(row) > 5 else "",
+                    "created_by_name": row[6] if len(row) > 6 else "",
+                })
+        _reminders_cache = reminders
+        return _reminders_cache
+    except Exception:
+        return []
+
+def get_reminder_next_id():
+    ws = get_reminders_ws()
+    rows = ws.get_all_values()
+    ids = [int(row[0]) for row in rows[1:] if row and row[0].isdigit()]
+    return max(ids) + 1 if ids else 1
+
+def add_reminder(content, mention_name, hour, minute, created_by, created_by_name):
+    global _reminders_cache
+    ws = get_reminders_ws()
+    next_id = get_reminder_next_id()
+    ws.append_row([next_id, content, mention_name, hour, minute, created_by, created_by_name])
+    _reminders_cache = None
+    return next_id
+
+def delete_reminder_by_id(reminder_id):
+    global _reminders_cache
+    ws = get_reminders_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(reminder_id):
+            ws.delete_rows(i + 1)
+            _reminders_cache = None
+            return True
+    return False
+
+def update_trigger_by_id(trigger_id, keyword, response_text, image_url, mention_name, match_type, reply_type, probability):
+    global _triggers_cache
+    ws = get_triggers_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(trigger_id):
+            ws.update(f"A{i+1}:H{i+1}", [[row[0], keyword, response_text, image_url, mention_name, match_type, reply_type, probability]])
+            _triggers_cache = None
+            return True
+    return False
+
 # ==================== Bot 設定 ====================
 class MyBot(commands.Bot):
     def __init__(self):
@@ -337,6 +405,84 @@ def update_record_by_id(record_id, debtor, creditor, amount, rate, item):
 def has_pending_records(name):
     records = load_records()
     return any(r["debtor"] == name or r["creditor"] == name for r in records)
+
+# ==================== 年度回顧統計 ====================
+TAIPEI_TZ = pytz.timezone("Asia/Taipei")
+
+def get_taiwan_now():
+    return datetime.now(pytz.utc).astimezone(TAIPEI_TZ)
+
+def taiwan_datetime_of(time_str: str):
+    naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    return pytz.utc.localize(naive).astimezone(TAIPEI_TZ)
+
+def taiwan_year_of(time_str: str) -> int:
+    return taiwan_datetime_of(time_str).year
+
+def load_history_records():
+    _, history_ws = get_worksheets()
+    rows = history_ws.get_all_values()
+    records = []
+    for row in rows[1:]:
+        if row and row[0]:
+            records.append({
+                "id": int(row[0]), "time": row[1], "clear_time": row[2],
+                "debtor": row[3], "creditor": row[4],
+                "amount": float(row[5]), "rate": float(row[6]), "item": row[7]
+            })
+    return records
+
+def load_records_by_year(year: int):
+    combined = [r for r in load_records() if taiwan_year_of(r["time"]) == year]
+    combined += [r for r in load_history_records() if taiwan_year_of(r["time"]) == year]
+    return combined
+
+def build_annual_review_chunks(year: int, records: list) -> list:
+    pair_groups = {}
+    for r in records:
+        p1, p2 = sorted([r["debtor"], r["creditor"]])
+        pair_groups.setdefault((p1, p2), []).append(r)
+
+    total_count = len(records)
+    total_amount = sum(r["amount"] * r["rate"] for r in records)
+    header = (f"📅 **{year} 年度回顧**\n" + "─" * 24 +
+              f"\n📈 全年總覽：共 {total_count} 筆交易，總金額 {round(total_amount)} NTD\n" + "─" * 24 + "\n")
+
+    blocks = []
+    for (p1, p2), group in sorted(pair_groups.items()):
+        owe = {p1: 0.0, p2: 0.0}
+        for r in group:
+            owe[r["debtor"]] += r["amount"] * r["rate"]
+        diff = owe[p1] - owe[p2]
+        if round(diff) == 0:
+            net_desc = "雙方年度打平 ⚖️"
+        elif diff > 0:
+            net_desc = f"{p1} 還欠 {p2} {round(diff)} NTD"
+        else:
+            net_desc = f"{p2} 還欠 {p1} {round(abs(diff))} NTD"
+
+        top = max(group, key=lambda r: r["amount"] * r["rate"])
+        top_date = taiwan_datetime_of(top["time"]).strftime("%Y/%m/%d")
+        top_amount = round(top["amount"] * top["rate"])
+
+        blocks.append(
+            f"👥 **{p1} vs {p2}**\n"
+            f"　來往筆數：{len(group)} 筆\n"
+            f"　最大單筆金額是{top_date}的\"{top['item']}\"，該筆{top['debtor']}欠{top['creditor']}:{top_amount}元\n"
+            f"　{p1} 欠 {p2}：{round(owe[p1])} NTD\n"
+            f"　{p2} 欠 {p1}：{round(owe[p2])} NTD\n"
+            f"　年度餘額：{net_desc}\n"
+        )
+
+    chunks, current = [], header
+    for block in blocks:
+        if len(current) + len(block) > 1800:
+            chunks.append(current)
+            current = block
+        else:
+            current += block
+    chunks.append(current)
+    return chunks
 
 # ==================== 中文完美對齊演算法 ====================
 def get_display_width(text):
@@ -1339,6 +1485,18 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     await interaction.followup.send(f"🤝 {n1} 與 {n2} 帳務已結清並歸檔。")
     await update_cashier_board()
 
+@bot.tree.command(name="年度回顧", description="查詢指定年度的雙方借貸總覽（預設今年至今）")
+@app_commands.describe(年份="要查詢的西元年份，例如 2025（留空則查詢今年至今）")
+async def slash_annual_review(interaction: discord.Interaction, 年份: int = None):
+    await interaction.response.defer()
+    year = 年份 or get_taiwan_now().year
+    records = load_records_by_year(year)
+    if not records:
+        await interaction.followup.send(f"📅 {year} 年度目前沒有任何借貸紀錄。")
+        return
+    for chunk in build_annual_review_chunks(year, records):
+        await interaction.followup.send(chunk)
+
 # ==================== 新增觸發詞 View + Modal ====================
 class AddTriggerView(discord.ui.View):
     def __init__(self, image_url: str = ""):
@@ -1432,47 +1590,148 @@ class AddTriggerModal(discord.ui.Modal, title="新增觸發詞"):
         if self.image_url: parts.append(f"　圖片：{self.image_url}")
         await interaction.followup.send("\n".join(parts), ephemeral=True)
 
+# ==================== 編輯觸發詞 View + Modal ====================
+class EditTriggerView(discord.ui.View):
+    def __init__(self, trigger: dict):
+        super().__init__(timeout=120)
+        self.trigger    = trigger
+        self.trigger_id = trigger["id"]
+        self.image_url  = trigger["image_url"]
+        self.match_type = trigger["match_type"]
+        self.reply_type = trigger["reply_type"]
+
+        match_select = discord.ui.Select(
+            placeholder="觸發方式",
+            options=[
+                discord.SelectOption(label="包含（訊息包含關鍵詞）",       value="contains", default=(trigger["match_type"] == "contains")),
+                discord.SelectOption(label="完全相符（整句等於關鍵詞）",   value="exact",    default=(trigger["match_type"] == "exact")),
+                discord.SelectOption(label="正則 Regex（如 彰.+人）",       value="regex",    default=(trigger["match_type"] == "regex")),
+            ]
+        )
+        match_select.callback = self.match_callback
+        self.add_item(match_select)
+
+        reply_select = discord.ui.Select(
+            placeholder="回覆方式",
+            options=[
+                discord.SelectOption(label="新訊息（獨立發送）",         value="new",   default=(trigger["reply_type"] == "new")),
+                discord.SelectOption(label="回覆該則（引用箭頭）",       value="reply", default=(trigger["reply_type"] == "reply")),
+            ]
+        )
+        reply_select.callback = self.reply_callback
+        self.add_item(reply_select)
+
+    async def match_callback(self, interaction: discord.Interaction):
+        self.match_type = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def reply_callback(self, interaction: discord.Interaction):
+        self.reply_type = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=2)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            EditTriggerModal(self.trigger_id, self.match_type, self.reply_type, self.image_url, self.trigger)
+        )
+
+class EditTriggerModal(discord.ui.Modal):
+    def __init__(self, trigger_id: int, match_type: str, reply_type: str, image_url: str, existing: dict):
+        super().__init__(title=f"編輯觸發詞 - 編號 {trigger_id:03d}")
+        self.trigger_id = trigger_id
+        self.match_type = match_type
+        self.reply_type = reply_type
+        self.image_url  = image_url
+        self.keyword_input  = discord.ui.TextInput(label="觸發關鍵詞", default=existing["keyword"])
+        self.response_input = discord.ui.TextInput(
+            label="回覆文字（<> 分隔多個選項，選填）",
+            default=existing["response_text"],
+            required=False, style=discord.TextStyle.paragraph
+        )
+        self.mention_input  = discord.ui.TextInput(label="要 @ 的成員名（選填）", default=existing["mention_name"], required=False)
+        self.prob_input     = discord.ui.TextInput(
+            label="觸發機率 0–100（多觸發詞競爭時的權重）",
+            default=str(existing["probability"]), required=False
+        )
+        self.add_item(self.keyword_input)
+        self.add_item(self.response_input)
+        self.add_item(self.mention_input)
+        self.add_item(self.prob_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        keyword      = self.keyword_input.value.strip()
+        response_text = self.response_input.value.strip()
+        mention      = self.mention_input.value.strip()
+        try:
+            prob = int(self.prob_input.value.strip() or "100")
+            if not 0 <= prob <= 100: raise ValueError
+        except ValueError:
+            await interaction.followup.send("❌ 機率必須是 0–100 的整數", ephemeral=True)
+            return
+        members = get_members()
+        if mention and mention not in members:
+            await interaction.followup.send(f"❌ 找不到成員「{mention}」，合法名單：{', '.join(members)}", ephemeral=True)
+            return
+        if not response_text and not self.image_url and not mention:
+            await interaction.followup.send("❌ 請至少填寫回覆文字、圖片或 @ 成員其中一項", ephemeral=True)
+            return
+        ok = update_trigger_by_id(self.trigger_id, keyword, response_text, self.image_url, mention, self.match_type, self.reply_type, prob)
+        if not ok:
+            await interaction.followup.send(f"❌ 找不到編號 {self.trigger_id:03d}，可能已被刪除", ephemeral=True)
+            return
+        ml = {"contains": "包含", "exact": "完全相符", "regex": "正則"}.get(self.match_type, self.match_type)
+        rl = {"new": "新訊息", "reply": "回覆該則"}.get(self.reply_type, self.reply_type)
+        parts = [f"✏️ **[{self.trigger_id:03d}] 觸發詞「{keyword}」修改成功！**",
+                 f"　觸發方式：{ml}　回覆方式：{rl}　機率：{prob}"]
+        if mention:        parts.append(f"　@ {mention}")
+        if response_text:  parts.append(f"　文字：{response_text[:50]}{'...' if len(response_text) > 50 else ''}")
+        if self.image_url: parts.append(f"　圖片：{self.image_url}")
+        await interaction.followup.send("\n".join(parts), ephemeral=True)
+
 # ==================== 觸發詞管理指令 ====================
+def build_trigger_line(t: dict) -> str:
+    mt_labels = {"contains": "包含", "exact": "完全相符", "regex": "正則"}
+    rt_labels = {"new": "新訊息", "reply": "回覆該則"}
+    preview_text    = f"　文字：{t['response_text'][:20]}{'...' if len(t['response_text']) > 20 else ''}" if t["response_text"] else ""
+    preview_img     = "　🖼️ 含圖片" if t["image_url"] else ""
+    preview_mention = f"　@ {t['mention_name']}" if t["mention_name"] else ""
+    ml = mt_labels.get(t["match_type"], t["match_type"])
+    rl = rt_labels.get(t["reply_type"], t["reply_type"])
+    meta = f"　[{ml} / {rl} / {t['probability']}%]"
+    return f"**[{t['id']:03d}]** `{t['keyword']}`{preview_mention}{preview_text}{preview_img}{meta}"
+
 def build_triggers_display():
     triggers = load_triggers()
     if not triggers:
         return "（尚無任何觸發詞）"
     lines = ["⚡ **觸發詞列表**", "─" * 24]
-    mt_labels = {"contains": "包含", "exact": "完全相符", "regex": "正則"}
-    rt_labels = {"new": "新訊息", "reply": "回覆該則"}
-    for t in triggers:
-        preview_text    = f"　文字：{t['response_text'][:20]}{'...' if len(t['response_text']) > 20 else ''}" if t["response_text"] else ""
-        preview_img     = "　🖼️ 含圖片" if t["image_url"] else ""
-        preview_mention = f"　@ {t['mention_name']}" if t["mention_name"] else ""
-        ml = mt_labels.get(t["match_type"], t["match_type"])
-        rl = rt_labels.get(t["reply_type"], t["reply_type"])
-        meta = f"　[{ml} / {rl} / {t['probability']}%]"
-        lines.append(f"**[{t['id']:03d}]** `{t['keyword']}`{preview_mention}{preview_text}{preview_img}{meta}")
+    lines.extend(build_trigger_line(t) for t in triggers)
     return "\n".join(lines)
 
 class TriggerManageView(discord.ui.View):
     def __init__(self, is_admin: bool):
         super().__init__(timeout=120)
         if not is_admin:
-            self.remove_item(self.delete_trigger)
+            self.remove_item(self.manage_trigger)
 
-    @discord.ui.button(label="刪除觸發詞", style=discord.ButtonStyle.danger)
-    async def delete_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="編輯 / 刪除觸發詞", style=discord.ButtonStyle.primary)
+    async def manage_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
         triggers = load_triggers()
         if not triggers:
-            await interaction.response.send_message("⚠️ 目前沒有觸發詞可刪除。", ephemeral=True)
+            await interaction.response.send_message("⚠️ 目前沒有觸發詞可管理。", ephemeral=True)
             return
         options = [
             discord.SelectOption(label=f"[{t['id']:03d}] {t['keyword']}", value=str(t["id"]))
             for t in triggers
         ][:25]
         await interaction.response.send_message(
-            "請選擇要刪除的觸發詞：",
-            view=TriggerDeleteSelectView(options),
+            "請選擇要編輯或刪除的觸發詞：",
+            view=TriggerSelectView(options),
             ephemeral=True
         )
 
-class TriggerDeleteSelectView(discord.ui.View):
+class TriggerSelectView(discord.ui.View):
     def __init__(self, options):
         super().__init__(timeout=60)
         select = discord.ui.Select(placeholder="選擇觸發詞", options=options)
@@ -1481,10 +1740,38 @@ class TriggerDeleteSelectView(discord.ui.View):
 
     async def select_callback(self, interaction: discord.Interaction):
         tid = int(interaction.data["values"][0])
+        trigger = next((t for t in load_triggers() if t["id"] == tid), None)
+        if not trigger:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {tid:03d}，可能已被刪除", view=None)
+            return
+        await interaction.response.edit_message(
+            content=f"已選擇：\n{build_trigger_line(trigger)}\n\n請選擇操作：",
+            view=TriggerActionView(trigger)
+        )
+
+class TriggerActionView(discord.ui.View):
+    def __init__(self, trigger: dict):
+        super().__init__(timeout=60)
+        self.trigger = trigger
+
+    @discord.ui.button(label="✏️ 編輯", style=discord.ButtonStyle.primary)
+    async def edit_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fresh = next((t for t in load_triggers() if t["id"] == self.trigger["id"]), None)
+        if not fresh:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {self.trigger['id']:03d}，可能已被刪除", view=None)
+            return
+        await interaction.response.edit_message(
+            content=f"✏️ **編輯觸發詞 [{fresh['id']:03d}]** — 請選擇觸發方式與回覆方式，再按下一步：",
+            view=EditTriggerView(fresh)
+        )
+
+    @discord.ui.button(label="🗑️ 刪除", style=discord.ButtonStyle.danger)
+    async def delete_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tid = self.trigger["id"]
         if delete_trigger_by_id(tid):
             await interaction.response.edit_message(content=f"✅ 已刪除觸發詞 [{tid:03d}]", view=None)
         else:
-            await interaction.response.edit_message(content=f"❌ 找不到編號 {tid:03d}", view=None)
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {tid:03d}，可能已被刪除", view=None)
 
 @bot.tree.command(name="觸發詞", description="查看所有觸發詞（管理員可刪除）")
 async def slash_triggers(interaction: discord.Interaction):
@@ -1521,28 +1808,315 @@ async def slash_delete_trigger(interaction: discord.Interaction, 編號: int):
     else:
         await interaction.followup.send(f"❌ 找不到編號 {編號:03d}", ephemeral=True)
 
-# ==================== 每日匯率通知 ====================
+@bot.tree.command(name="編輯觸發詞", description="依編號編輯觸發詞（管理員）")
+@app_commands.describe(image="附上新圖片可取代原圖（選填，留空則保留原圖）")
+async def slash_edit_trigger(interaction: discord.Interaction, 編號: int, image: discord.Attachment = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    trigger = next((t for t in load_triggers() if t["id"] == 編號), None)
+    if not trigger:
+        await interaction.followup.send(f"❌ 找不到編號 {編號:03d}", ephemeral=True)
+        return
+    image_url = trigger["image_url"]
+    if image:
+        try:
+            image_url = await upload_to_imgbb(image)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 圖片上傳失敗：{e}", ephemeral=True)
+            return
+    trigger_for_view = dict(trigger)
+    trigger_for_view["image_url"] = image_url
+    await interaction.followup.send(f"✏️ **編輯觸發詞 [{編號:03d}]** — 請選擇觸發方式與回覆方式，再按下一步：",
+                                    view=EditTriggerView(trigger_for_view), ephemeral=True)
+
+# ==================== 每日提醒 ====================
+class ReminderActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.action = "add"
+        select = discord.ui.Select(placeholder="你想要...", options=[
+            discord.SelectOption(label="➕ 新增每日提醒", value="add", default=True),
+            discord.SelectOption(label="🗑️ 刪除每日提醒", value="delete"),
+            discord.SelectOption(label="⚙️ 播報設定（美股/匯率開關與門檻，管理員限定）", value="settings"),
+        ])
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        self.action = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=1)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action == "add":
+            await interaction.response.edit_message(
+                content="⏰ **新增每日提醒** — 請選擇提醒時間，需要 tag 人可一併選擇：",
+                view=AddReminderView()
+            )
+        elif self.action == "delete":
+            reminders = load_reminders()
+            if not interaction.user.guild_permissions.administrator:
+                reminders = [r for r in reminders if r["created_by"] == str(interaction.user.id)]
+            if not reminders:
+                await interaction.response.edit_message(content="⚠️ 目前沒有可以刪除的每日提醒。", view=None)
+                return
+            options = [
+                discord.SelectOption(label=f"[{r['id']:03d}] {r['hour']:02d}:{r['minute']:02d} {r['content'][:30]}", value=str(r["id"]))
+                for r in reminders
+            ][:25]
+            await interaction.response.edit_message(content="🗑️ 請選擇要刪除的每日提醒：", view=ReminderDeleteSelectView(options))
+        else:  # settings
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.edit_message(content="❌ 只有管理員能修改播報設定", view=None)
+                return
+            config = load_config()
+            await interaction.response.edit_message(
+                content="⚙️ **播報設定** — 請選擇美股/匯率播報開關，再按下一步設定匯率門檻：",
+                view=BroadcastSettingsView(config)
+            )
+
+class BroadcastSettingsView(discord.ui.View):
+    def __init__(self, config: dict):
+        super().__init__(timeout=120)
+        self.stock_enabled = config.get("stock_report_enabled", "on") == "on"
+        self.jpy_enabled = config.get("jpy_report_enabled", "on") == "on"
+
+        stock_select = discord.ui.Select(placeholder="美股播報", options=[
+            discord.SelectOption(label="開啟", value="on", default=self.stock_enabled),
+            discord.SelectOption(label="關閉", value="off", default=not self.stock_enabled),
+        ])
+        stock_select.callback = self.stock_callback
+        self.add_item(stock_select)
+
+        jpy_select = discord.ui.Select(placeholder="日幣匯率播報", options=[
+            discord.SelectOption(label="開啟", value="on", default=self.jpy_enabled),
+            discord.SelectOption(label="關閉", value="off", default=not self.jpy_enabled),
+        ])
+        jpy_select.callback = self.jpy_callback
+        self.add_item(jpy_select)
+
+    async def stock_callback(self, interaction: discord.Interaction):
+        self.stock_enabled = interaction.data["values"][0] == "on"
+        await interaction.response.defer()
+
+    async def jpy_callback(self, interaction: discord.Interaction):
+        self.jpy_enabled = interaction.data["values"][0] == "on"
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →（設定匯率門檻）", style=discord.ButtonStyle.primary, row=2)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BroadcastSettingsModal(self.stock_enabled, self.jpy_enabled))
+
+class BroadcastSettingsModal(discord.ui.Modal, title="播報設定"):
+    def __init__(self, stock_enabled: bool, jpy_enabled: bool):
+        super().__init__()
+        self.stock_enabled = stock_enabled
+        self.jpy_enabled = jpy_enabled
+        config = load_config()
+        self.threshold_input = discord.ui.TextInput(
+            label="匯率划算門檻（低於這個值才顯示划算文案）",
+            default=str(config.get("jpy_threshold", JPY_THRESHOLD)),
+        )
+        self.add_item(self.threshold_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            threshold = float(self.threshold_input.value.strip())
+        except ValueError:
+            await interaction.followup.send("❌ 匯率門檻必須是數字", ephemeral=True)
+            return
+        save_config("stock_report_enabled", "on" if self.stock_enabled else "off")
+        save_config("jpy_report_enabled", "on" if self.jpy_enabled else "off")
+        save_config("jpy_threshold", threshold)
+        await interaction.followup.send(
+            f"✅ **播報設定已更新**\n"
+            f"　美股播報：{'開啟' if self.stock_enabled else '關閉'}\n"
+            f"　匯率播報：{'開啟' if self.jpy_enabled else '關閉'}\n"
+            f"　匯率划算門檻：{threshold}",
+            ephemeral=True
+        )
+
+class ReminderDeleteSelectView(discord.ui.View):
+    def __init__(self, options):
+        super().__init__(timeout=60)
+        select = discord.ui.Select(placeholder="選擇要刪除的提醒", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        rid = int(interaction.data["values"][0])
+        if delete_reminder_by_id(rid):
+            await interaction.response.edit_message(content=f"🗑️ 已刪除每日提醒 [{rid:03d}]", view=None)
+        else:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {rid:03d}，可能已被刪除", view=None)
+
+class AddReminderView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.hour = 9
+        self.minute = 0
+        self.mention_name = ""
+
+        hour_select = discord.ui.Select(placeholder="小時 (0-23)",
+            options=[discord.SelectOption(label=f"{h:02d} 時", value=str(h)) for h in range(24)])
+        hour_select.callback = self.hour_callback
+        self.add_item(hour_select)
+
+        minute_select = discord.ui.Select(placeholder="分鐘",
+            options=[discord.SelectOption(label=f"{m:02d} 分", value=str(m)) for m in (0, 15, 30, 45)])
+        minute_select.callback = self.minute_callback
+        self.add_item(minute_select)
+
+        mention_options = [discord.SelectOption(label="不需要 tag", value="", default=True)] + \
+                           [discord.SelectOption(label=m, value=m) for m in get_members()]
+        mention_select = discord.ui.Select(placeholder="要 tag 的對象（選填）", options=mention_options[:25])
+        mention_select.callback = self.mention_callback
+        self.add_item(mention_select)
+
+    async def hour_callback(self, interaction):
+        self.hour = int(interaction.data["values"][0]); await interaction.response.defer()
+
+    async def minute_callback(self, interaction):
+        self.minute = int(interaction.data["values"][0]); await interaction.response.defer()
+
+    async def mention_callback(self, interaction):
+        self.mention_name = interaction.data["values"][0]; await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=3)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddReminderModal(self.hour, self.minute, self.mention_name))
+
+class AddReminderModal(discord.ui.Modal, title="新增每日提醒"):
+    def __init__(self, hour: int, minute: int, mention_name: str):
+        super().__init__()
+        self.hour = hour
+        self.minute = minute
+        self.mention_name = mention_name
+        self.content_input = discord.ui.TextInput(label="提醒的內容", style=discord.TextStyle.paragraph)
+        self.add_item(self.content_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        content = self.content_input.value.strip()
+        if not content:
+            await interaction.followup.send("❌ 提醒內容不能空白", ephemeral=True)
+            return
+        new_id = add_reminder(content, self.mention_name, self.hour, self.minute,
+                               str(interaction.user.id), interaction.user.display_name)
+        mention_str = f"，並會 tag {self.mention_name}" if self.mention_name else ""
+        await interaction.followup.send(
+            f"✅ **每日提醒 [{new_id:03d}] 新增成功！**\n"
+            f"　時間：每天 {self.hour:02d}:{self.minute:02d}\n"
+            f"　內容：{content}{mention_str}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="每日提醒", description="新增或刪除你的每日固定提醒")
+async def slash_daily_reminder(interaction: discord.Interaction):
+    await interaction.response.send_message("⏰ 你想要新增還是刪除每日提醒？", view=ReminderActionView(), ephemeral=True)
+
+# ==================== 每日播報（匯率 + 美股）====================
 NOTIFY_CHANNEL_ID = 472053843367297026
 JPY_THRESHOLD = 0.198
 
+US_INDICES = [
+    ("^DJI", "道瓊工業"),
+    ("^IXIC", "那斯達克"),
+    ("^GSPC", "標普500"),
+    ("^SOX", "費城半導體"),
+]
+
+async def fetch_us_market_summary():
+    import aiohttp
+    lines = []
+    any_up = any_down = False
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for symbol, label in US_INDICES:
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                closes = [c for c in data["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c is not None]
+                latest, prev = closes[-1], closes[-2]
+                change = latest - prev
+                pct = change / prev * 100
+                arrow = "🔺" if change >= 0 else "🔻"
+                lines.append(f"　{label}：{latest:,.2f}（{arrow}{change:+,.2f}，{pct:+.2f}%）")
+                if pct > 3: any_up = True
+                if pct < -3: any_down = True
+            except Exception:
+                lines.append(f"　{label}：查詢失敗")
+    return lines, any_up, any_down
+
 @tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
 async def daily_rate_check():
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if not channel:
+        return
+
+    config = load_config()
+    jpy_enabled = config.get("jpy_report_enabled", "on") == "on"
+    stock_enabled = config.get("stock_report_enabled", "on") == "on"
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
-                data = await resp.json()
-                rate = data["rates"]["TWD"]
-        
-        if rate < JPY_THRESHOLD:
-            channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-            if channel:
-                await channel.send(
-                    f"💴 **現在日幣匯率：1 JPY = {rate:.4f} TWD**\n"
-                    f"現在日幣正划算，老師們快換日幣吧，替老師精打細算也是我的工作呢 📊"
-                )
-    except Exception as e:
-        print(f"⚠️ 匯率查詢失敗：{e}")
+        threshold = float(config.get("jpy_threshold", JPY_THRESHOLD))
+    except (TypeError, ValueError):
+        threshold = JPY_THRESHOLD
+
+    lines = []
+    if jpy_enabled:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
+                    data = await resp.json()
+                    rate = data["rates"]["TWD"]
+            lines.append(f"💴 **現在日幣匯率：1 JPY = {rate:.4f} TWD**")
+            if rate < threshold:
+                lines.append("現在日幣正划算，老師們快換日幣吧，替老師精打細算也是我的工作呢 📊")
+        except Exception as e:
+            print(f"⚠️ 匯率查詢失敗：{e}")
+            lines.append("💴 匯率查詢失敗")
+
+    if stock_enabled:
+        try:
+            stock_lines, any_up, any_down = await fetch_us_market_summary()
+            if lines:
+                lines.append("")
+            lines.append("📈 **昨夜美股收盤**")
+            lines.extend(stock_lines)
+            if any_up:
+                lines.append("")
+                lines.append("今天又是睡醒數錢的日子呢哼哼😆，優香會繼續賺我跟老師的結婚基金的💖")
+            if any_down:
+                lines.append("")
+                lines.append("嗚嗚嗚，又是睡公園的日子，今天要跟SRT小隊搶公園廁所了")
+        except Exception as e:
+            print(f"⚠️ 美股資料查詢失敗：{e}")
+            lines.append("📈 美股資料查詢失敗")
+
+    if lines:
+        await channel.send("\n".join(lines))
+
+@tasks.loop(minutes=1)
+async def reminder_check():
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if not channel:
+        return
+    now = get_taiwan_now()
+    reminders = [r for r in load_reminders() if r["hour"] == now.hour and r["minute"] == now.minute]
+    if not reminders:
+        return
+    data = load_members_data()
+    name_to_id = {v: k for k, v in data["discord_map"].items()}
+    for r in reminders:
+        mention = ""
+        if r["mention_name"]:
+            discord_id = name_to_id.get(r["mention_name"])
+            mention = f"<@{discord_id}> " if discord_id else f"{r['mention_name']} "
+        await channel.send(f"⏰ {mention}{r['content']}")
 
 # ==================== 關鍵字偵測 ====================
 ROLE_ID = 937360224493396018
@@ -1614,6 +2188,7 @@ async def on_message(message: discord.Message):
 async def on_ready():
     print(f"成功登入！機器人：{bot.user}")
     daily_rate_check.start()
+    reminder_check.start()
 
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
