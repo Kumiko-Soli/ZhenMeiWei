@@ -1178,16 +1178,24 @@ class SetChannelsModal(discord.ui.Modal, title="設定頻道 ID"):
             placeholder="右鍵點擊頻道 → 複製頻道 ID",
             default=str(config.get("recovery_channel_id", "")) if config.get("recovery_channel_id") else ""
         )
+        self.notify_input = discord.ui.TextInput(
+            label="每日播報／提醒頻道 ID",
+            placeholder="右鍵點擊頻道 → 複製頻道 ID",
+            default=str(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
+        )
         self.add_item(self.cashier_input)
         self.add_item(self.recovery_input)
+        self.add_item(self.notify_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         try:
             cashier_id  = int(self.cashier_input.value.strip())
             recovery_id = int(self.recovery_input.value.strip())
+            notify_id   = int(self.notify_input.value.strip())
             save_config("cashier_channel_id", cashier_id)
             save_config("recovery_channel_id", recovery_id)
+            save_config("notify_channel_id", notify_id)
             await interaction.followup.send("✅ 頻道設定完成！", ephemeral=True)
         except ValueError:
             await interaction.followup.send("❌ 頻道 ID 必須是純數字", ephemeral=True)
@@ -1229,7 +1237,7 @@ async def slash_record(interaction: discord.Interaction, debtor: str, creditor: 
     await interaction.followup.send(f"✅ [編號 {new_id:03d}] 快速紀錄成功！", ephemeral=True)
     await update_cashier_board()
 
-@bot.tree.command(name="表單", description="開啟下拉選單選人，再填寫金額 (手機端推薦)")
+@bot.tree.command(name="表單記帳", description="開啟下拉選單選人，再填寫金額 (手機端推薦)")
 async def slash_modal(interaction: discord.Interaction):
     members = get_members()
     if not members:
@@ -1245,28 +1253,38 @@ async def slash_split(interaction: discord.Interaction):
         return
     await interaction.response.send_message("💸 **分帳 — 步驟一：選擇付錢的人**", view=SplitPayerView(), ephemeral=True)
 
-@bot.tree.command(name="成員管理", description="查看或管理成員名單與 Discord 對應")
-async def slash_members(interaction: discord.Interaction):
+class AdminToolsView(discord.ui.View):
+    def __init__(self, is_admin: bool):
+        super().__init__(timeout=120)
+        self.is_admin = is_admin
+        self.choice = "members"
+        options = [discord.SelectOption(label="👥 成員管理", value="members", default=True)]
+        if is_admin:
+            options.append(discord.SelectOption(label="📺 設定頻道", value="channels"))
+            options.append(discord.SelectOption(label="📊 設定試算表", value="sheet"))
+        select = discord.ui.Select(placeholder="你想要...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        self.choice = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=1)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.choice == "members":
+            await interaction.response.edit_message(content=build_members_display(), view=MembersManageView(self.is_admin))
+        elif self.choice == "channels":
+            await interaction.response.send_modal(SetChannelsModal())
+        elif self.choice == "sheet":
+            await interaction.response.send_modal(SetSheetModal())
+
+@bot.tree.command(name="管理者工具", description="成員管理／設定頻道／設定試算表")
+async def slash_admin_tools(interaction: discord.Interaction):
     is_admin = interaction.user.guild_permissions.administrator
-    content  = build_members_display()
-    view     = MembersManageView(is_admin)
-    await interaction.response.send_message(content=content, view=view, ephemeral=True)
+    await interaction.response.send_message("🛠️ **管理者工具** — 請選擇要做什麼：", view=AdminToolsView(is_admin), ephemeral=True)
 
-@bot.tree.command(name="設定頻道", description="設定收銀台與餐盤回收區頻道（管理員）")
-async def slash_set_channels(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
-        return
-    await interaction.response.send_modal(SetChannelsModal())
-
-@bot.tree.command(name="設定試算表", description="設定 Google Sheet ID（管理員）")
-async def slash_set_sheet(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
-        return
-    await interaction.response.send_modal(SetSheetModal())
-
-@bot.tree.command(name="修改", description="修改特定編號的帳目內容")
+@bot.tree.command(name="修改帳目", description="修改特定編號的帳目內容")
 async def slash_modify(interaction: discord.Interaction, 編號: int):
     await interaction.response.defer(ephemeral=True)
     records = load_records()
@@ -1277,7 +1295,7 @@ async def slash_modify(interaction: discord.Interaction, 編號: int):
     await interaction.followup.send("請填寫修改內容：", ephemeral=True)
     await interaction.response.send_modal(ModifyModal(編號, old_data))
 
-@bot.tree.command(name="刪除", description="依編號刪除紀錄")
+@bot.tree.command(name="刪除帳目", description="依編號刪除紀錄")
 async def slash_delete(interaction: discord.Interaction, 編號: int):
     await interaction.response.defer()
     if delete_record_by_id(編號):
@@ -1288,6 +1306,9 @@ async def slash_delete(interaction: discord.Interaction, 編號: int):
 
 @bot.tree.command(name="清空收銀台", description="強制清空收銀台頻道內的所有訊息")
 async def slash_purge(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
+        return
     config = load_config()
     channel = bot.get_channel(config.get("cashier_channel_id", 0))
     if not channel:
@@ -1351,19 +1372,6 @@ async def slash_blue_white(interaction: discord.Interaction):
     )
     await interaction.channel.send(message)
     await interaction.followup.send("✅ 已發出公告", ephemeral=True)
-
-@bot.tree.command(name="測試匯率", description="測試匯率查詢")
-async def slash_test_rate(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
-                data = await resp.json()
-                rate = data["rates"]["TWD"]
-                await interaction.followup.send(f"✅ 目前匯率：1 JPY = {rate:.4f} TWD", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ 查詢失敗：{e}", ephemeral=True)
 
 @bot.tree.command(name="林佳龍", description="心疼本群最大債主！")
 async def slash_lin(interaction: discord.Interaction):
@@ -1773,7 +1781,7 @@ class TriggerActionView(discord.ui.View):
         else:
             await interaction.response.edit_message(content=f"❌ 找不到編號 {tid:03d}，可能已被刪除", view=None)
 
-@bot.tree.command(name="觸發詞", description="查看所有觸發詞（管理員可刪除）")
+@bot.tree.command(name="管理觸發詞", description="查看所有觸發詞，管理員可編輯或刪除")
 async def slash_triggers(interaction: discord.Interaction):
     is_admin = interaction.user.guild_permissions.administrator
     content  = build_triggers_display()
@@ -1796,40 +1804,6 @@ async def slash_add_trigger(interaction: discord.Interaction, image: discord.Att
             return
     await interaction.followup.send("⚡ **新增觸發詞** — 請選擇觸發方式與回覆方式，再按下一步：",
                                     view=AddTriggerView(image_url), ephemeral=True)
-
-@bot.tree.command(name="刪除觸發詞", description="依編號刪除觸發詞（管理員）")
-async def slash_delete_trigger(interaction: discord.Interaction, 編號: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    if delete_trigger_by_id(編號):
-        await interaction.followup.send(f"🗑️ 已刪除觸發詞 [{編號:03d}]", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ 找不到編號 {編號:03d}", ephemeral=True)
-
-@bot.tree.command(name="編輯觸發詞", description="依編號編輯觸發詞（管理員）")
-@app_commands.describe(image="附上新圖片可取代原圖（選填，留空則保留原圖）")
-async def slash_edit_trigger(interaction: discord.Interaction, 編號: int, image: discord.Attachment = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    trigger = next((t for t in load_triggers() if t["id"] == 編號), None)
-    if not trigger:
-        await interaction.followup.send(f"❌ 找不到編號 {編號:03d}", ephemeral=True)
-        return
-    image_url = trigger["image_url"]
-    if image:
-        try:
-            image_url = await upload_to_imgbb(image)
-        except Exception as e:
-            await interaction.followup.send(f"❌ 圖片上傳失敗：{e}", ephemeral=True)
-            return
-    trigger_for_view = dict(trigger)
-    trigger_for_view["image_url"] = image_url
-    await interaction.followup.send(f"✏️ **編輯觸發詞 [{編號:03d}]** — 請選擇觸發方式與回覆方式，再按下一步：",
-                                    view=EditTriggerView(trigger_for_view), ephemeral=True)
 
 # ==================== 每日提醒 ====================
 class ReminderActionView(discord.ui.View):
@@ -2053,11 +2027,11 @@ async def fetch_us_market_summary():
 
 @tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
 async def daily_rate_check():
-    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    config = load_config()
+    channel = bot.get_channel(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
     if not channel:
         return
 
-    config = load_config()
     jpy_enabled = config.get("jpy_report_enabled", "on") == "on"
     stock_enabled = config.get("stock_report_enabled", "on") == "on"
     try:
@@ -2102,7 +2076,8 @@ async def daily_rate_check():
 
 @tasks.loop(minutes=1)
 async def reminder_check():
-    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    config = load_config()
+    channel = bot.get_channel(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
     if not channel:
         return
     now = get_taiwan_now()
