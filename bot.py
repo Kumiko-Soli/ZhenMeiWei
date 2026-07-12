@@ -457,22 +457,25 @@ def build_annual_review_chunks(year: int, records: list) -> list:
         if round(diff) == 0:
             net_desc = "雙方年度打平 ⚖️"
         elif diff > 0:
-            net_desc = f"{p1} 還欠 {p2} {round(diff)} NTD"
+            net_desc = f"+ {p1} 還欠 {p2} {round(diff)} NTD"
         else:
-            net_desc = f"{p2} 還欠 {p1} {round(abs(diff))} NTD"
+            net_desc = f"+ {p2} 還欠 {p1} {round(abs(diff))} NTD"
 
         top = max(group, key=lambda r: r["amount"] * r["rate"])
         top_date = taiwan_datetime_of(top["time"]).strftime("%Y/%m/%d")
         top_amount = round(top["amount"] * top["rate"])
 
-        blocks.append(
-            f"👥 **{p1} vs {p2}**\n"
-            f"　來往筆數：{len(group)} 筆\n"
-            f"　最大單筆金額是{top_date}的\"{top['item']}\"，該筆{top['debtor']}欠{top['creditor']}:{top_amount}元\n"
-            f"　{p1} 欠 {p2}：{round(owe[p1])} NTD\n"
-            f"　{p2} 欠 {p1}：{round(owe[p2])} NTD\n"
-            f"　年度餘額：{net_desc}\n"
+        info_block = (
+            "```\n"
+            f"👥 {p1} vs {p2}\n"
+            f"來往筆數：{len(group)} 筆\n"
+            f"最大單筆金額是{top_date}的\"{top['item']}\"，該筆{top['debtor']}欠{top['creditor']}:{top_amount}元\n"
+            f"{p1} 欠 {p2}：{round(owe[p1])} NTD\n"
+            f"{p2} 欠 {p1}：{round(owe[p2])} NTD\n"
+            "```\n"
         )
+        diff_block = f"```diff\n{net_desc}\n```\n"
+        blocks.append(info_block + diff_block)
 
     chunks, current = [], header
     for block in blocks:
