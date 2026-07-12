@@ -1947,7 +1947,7 @@ class AddReminderView(discord.ui.View):
         minute_select.callback = self.minute_callback
         self.add_item(minute_select)
 
-        mention_options = [discord.SelectOption(label="不需要 tag", value="", default=True)] + \
+        mention_options = [discord.SelectOption(label="不需要 tag", value="none", default=True)] + \
                            [discord.SelectOption(label=m, value=m) for m in get_members()]
         mention_select = discord.ui.Select(placeholder="要 tag 的對象（選填）", options=mention_options[:25])
         mention_select.callback = self.mention_callback
@@ -1960,7 +1960,9 @@ class AddReminderView(discord.ui.View):
         self.minute = int(interaction.data["values"][0]); await interaction.response.defer()
 
     async def mention_callback(self, interaction):
-        self.mention_name = interaction.data["values"][0]; await interaction.response.defer()
+        value = interaction.data["values"][0]
+        self.mention_name = "" if value == "none" else value
+        await interaction.response.defer()
 
     @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=3)
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
