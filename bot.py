@@ -46,7 +46,6 @@ _spreadsheet = None
 _config_cache = None
 _members_cache = None
 _triggers_cache = None
-_reminders_cache = None
 
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
@@ -255,9 +254,6 @@ def delete_trigger_by_id(trigger_id):
     return False
 
 def load_reminders():
-    global _reminders_cache
-    if _reminders_cache is not None:
-        return _reminders_cache
     try:
         ws = get_reminders_ws()
         rows = ws.get_all_values()
@@ -273,8 +269,7 @@ def load_reminders():
                     "created_by": row[5] if len(row) > 5 else "",
                     "created_by_name": row[6] if len(row) > 6 else "",
                 })
-        _reminders_cache = reminders
-        return _reminders_cache
+        return reminders
     except Exception:
         return []
 
@@ -285,15 +280,12 @@ def get_reminder_next_id():
     return max(ids) + 1 if ids else 1
 
 def add_reminder(content, mention_name, hour, minute, created_by, created_by_name):
-    global _reminders_cache
     ws = get_reminders_ws()
     next_id = get_reminder_next_id()
     ws.append_row([next_id, content, mention_name, hour, minute, created_by, created_by_name])
-    _reminders_cache = None
     return next_id
 
 def delete_reminder_by_id(reminder_id):
-    global _reminders_cache
     ws = get_reminders_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -301,7 +293,6 @@ def delete_reminder_by_id(reminder_id):
             continue
         if row and row[0] == str(reminder_id):
             ws.delete_rows(i + 1)
-            _reminders_cache = None
             return True
     return False
 
@@ -1943,7 +1934,7 @@ class AddReminderView(discord.ui.View):
         self.add_item(hour_select)
 
         minute_select = discord.ui.Select(placeholder="分鐘",
-            options=[discord.SelectOption(label=f"{m:02d} 分", value=str(m)) for m in (0, 15, 30, 45)])
+            options=[discord.SelectOption(label=f"{m:02d} 分", value=str(m)) for m in range(0, 60, 5)])
         minute_select.callback = self.minute_callback
         self.add_item(minute_select)
 
