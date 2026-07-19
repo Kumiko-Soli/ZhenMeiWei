@@ -2584,7 +2584,7 @@ async def slash_purchase_request(
         "created_by_discord_id": str(interaction.user.id),
     }
     trip = get_trip_for_agent(代購人.id)
-    trip_line = f"📍 {代購人.display_name} 目前行程：{trip['itinerary_text']}\n" if trip else f"⚠️ {代購人.display_name} 目前沒有登記行程，請自行確認對方是否方便代購。\n"
+    trip_line = f"📍 {代購人.display_name} 目前行程：\n{trip['itinerary_text']}\n" if trip else f"⚠️ {代購人.display_name} 目前沒有登記行程，請自行確認對方是否方便代購。\n"
     await interaction.response.send_message(
         f"📝 **代購委託 — 委託給 {代購人.mention}**\n"
         f"　委託人：{requester_name}\n"
@@ -2912,7 +2912,7 @@ class TripActionView(discord.ui.View):
             await interaction.response.edit_message(
                 content=(
                     f"⚠️ **確定要結束行程嗎？**\n"
-                    f"目前行程：{trip['itinerary_text'][:200]}\n"
+                    f"目前行程：\n{trip['itinerary_text'][:200]}\n"
                     f"這趟共 {count} 筆委託（不分狀態）將會從 `/代購進度` 移除、歸檔到歷史紀錄，之後不會再顯示在清單裡。"
                 ),
                 view=TripEndConfirmView(),
