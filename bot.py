@@ -2897,12 +2897,12 @@ async def slash_trip(interaction: discord.Interaction):
     await interaction.response.send_message("📍 你想要開始／更新行程，還是結束行程？", view=TripActionView(), ephemeral=True)
 
 @bot.tree.command(name="代購強制刪除", description="管理員緊急清空某位代購人名下所有委託（不會顯示物品內容，僅供代購人失聯等情況使用）")
-@app_commands.describe(代購人ID="代購人的 Discord 使用者 ID（純數字，開發者模式右鍵複製，即使對方已離開群組也能用）")
-async def slash_purchase_force_delete(interaction: discord.Interaction, 代購人ID: str):
+@app_commands.describe(代購人id="代購人的 Discord 使用者 ID（純數字，開發者模式右鍵複製，即使對方已離開群組也能用）")
+async def slash_purchase_force_delete(interaction: discord.Interaction, 代購人id: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
         return
-    agent_id = 代購人ID.strip()
+    agent_id = 代購人id.strip()
     if not agent_id.isdigit():
         await interaction.response.send_message("❌ 代購人ID 必須是純數字的 Discord 使用者 ID", ephemeral=True)
         return
