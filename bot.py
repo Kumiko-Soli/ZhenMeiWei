@@ -2311,6 +2311,19 @@ class PurchaseModalA(discord.ui.Modal, title="代購委託 (1/2) - 物品資訊"
         self.context["store_location"] = self.location_input.value.strip()
         self.context["spec_conditions"] = self.spec_input.value.strip()
         self.context["item_nature"] = self.nature_input.value.strip()
+        await interaction.response.send_message(
+            "✅ 第一段已記錄，請按下方按鈕繼續填寫第二段（金額與聯絡方式）：",
+            view=PurchaseModalBLauncherView(self.context),
+            ephemeral=True,
+        )
+
+class PurchaseModalBLauncherView(discord.ui.View):
+    def __init__(self, context: dict):
+        super().__init__(timeout=120)
+        self.context = context
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(PurchaseModalB(self.context))
 
 class PurchaseModalB(discord.ui.Modal, title="代購委託 (2/2) - 金額與聯絡方式"):
@@ -2617,7 +2630,20 @@ class EditPurchaseModalA(discord.ui.Modal, title="修改委託 (1/2) - 物品資
         self.existing["store_location"] = self.location_input.value.strip()
         self.existing["spec_conditions"] = self.spec_input.value.strip()
         self.existing["item_nature"] = self.nature_input.value.strip()
-        await interaction.response.send_modal(EditPurchaseModalB(self.existing))
+        await interaction.response.send_message(
+            "✅ 第一段已記錄，請按下方按鈕繼續填寫第二段（金額與聯絡方式）：",
+            view=EditPurchaseModalBLauncherView(self.existing),
+            ephemeral=True,
+        )
+
+class EditPurchaseModalBLauncherView(discord.ui.View):
+    def __init__(self, purchase: dict):
+        super().__init__(timeout=120)
+        self.purchase = purchase
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EditPurchaseModalB(self.purchase))
 
 class EditPurchaseModalB(discord.ui.Modal, title="修改委託 (2/2) - 金額與聯絡方式"):
     def __init__(self, purchase: dict):
