@@ -4,6 +4,7 @@ import json
 import base64
 import random
 import re
+import asyncio
 from datetime import datetime
 from flask import Flask
 from threading import Thread
@@ -46,6 +47,8 @@ _spreadsheet = None
 _config_cache = None
 _members_cache = None
 _triggers_cache = None
+_purchases_cache = None
+_trips_cache = None
 
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
@@ -87,6 +90,15 @@ def get_triggers_ws():
 
 def get_reminders_ws():
     return get_spreadsheet().worksheet("reminders")
+
+def get_purchases_ws():
+    return get_spreadsheet().worksheet("purchases")
+
+def get_trips_ws():
+    return get_spreadsheet().worksheet("trips")
+
+def get_trip_history_ws():
+    return get_spreadsheet().worksheet("trip_history")
 
 # ==================== 設定檔讀寫（Google Sheets）====================
 def load_config():
@@ -308,6 +320,203 @@ def update_trigger_by_id(trigger_id, keyword, response_text, image_url, mention_
             _triggers_cache = None
             return True
     return False
+
+# ==================== 代購資料讀寫（Google Sheets）====================
+def load_purchases():
+    global _purchases_cache
+    if _purchases_cache is not None:
+        return _purchases_cache
+    try:
+        ws = get_purchases_ws()
+        rows = ws.get_all_values()
+        purchases = []
+        for row in rows[1:]:
+            if row and row[0]:
+                purchases.append({
+                    "id":                          int(row[0]),
+                    "status":                      row[1] if len(row) > 1 and row[1] else "pending",
+                    "agent_discord_id":            row[2] if len(row) > 2 else "",
+                    "agent_display_name":          row[3] if len(row) > 3 else "",
+                    "creation_source":             row[4] if len(row) > 4 else "self",
+                    "requester_discord_id":        row[5] if len(row) > 5 else "",
+                    "requester_display_name":      row[6] if len(row) > 6 else "",
+                    "requester_line_id":           row[7] if len(row) > 7 else "",
+                    "item_description":            row[8] if len(row) > 8 else "",
+                    "image_url_1":                 row[9] if len(row) > 9 else "",
+                    "image_url_2":                 row[10] if len(row) > 10 else "",
+                    "image_url_3":                 row[11] if len(row) > 11 else "",
+                    "store_location":              row[12] if len(row) > 12 else "",
+                    "auto_approve_limit_jpy":       int(row[13]) if len(row) > 13 and row[13].isdigit() else 0,
+                    "confirm_required_above_jpy":   int(row[14]) if len(row) > 14 and row[14].isdigit() else 0,
+                    "spec_conditions":             row[15] if len(row) > 15 else "",
+                    "item_nature":                 row[16] if len(row) > 16 else "",
+                    "notes":                       row[17] if len(row) > 17 else "",
+                    "acknowledged_risk":           row[18] if len(row) > 18 else "",
+                    "created_by_discord_id":       row[19] if len(row) > 19 else "",
+                    "created_at":                  row[20] if len(row) > 20 else "",
+                    "updated_at":                  row[21] if len(row) > 21 else "",
+                })
+        _purchases_cache = purchases
+        return _purchases_cache
+    except Exception:
+        return []
+
+def get_purchase_next_id():
+    ws = get_purchases_ws()
+    rows = ws.get_all_values()
+    ids = [int(row[0]) for row in rows[1:] if row and row[0].isdigit()]
+    return max(ids) + 1 if ids else 1
+
+def add_purchase(agent_discord_id, agent_display_name, creation_source,
+                  requester_discord_id, requester_display_name, requester_line_id,
+                  item_description, image_url_1, image_url_2, image_url_3,
+                  store_location, auto_approve_limit_jpy, confirm_required_above_jpy,
+                  spec_conditions, item_nature, notes, created_by_discord_id):
+    global _purchases_cache
+    ws = get_purchases_ws()
+    next_id = get_purchase_next_id()
+    now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
+    ws.append_row([
+        next_id, "pending", agent_discord_id, agent_display_name, creation_source,
+        requester_discord_id, requester_display_name, requester_line_id,
+        item_description, image_url_1, image_url_2, image_url_3,
+        store_location, auto_approve_limit_jpy, confirm_required_above_jpy,
+        spec_conditions, item_nature, notes, "TRUE", created_by_discord_id,
+        now, now,
+    ])
+    _purchases_cache = None
+    return next_id
+
+def update_purchase_status_by_id(purchase_id, new_status):
+    global _purchases_cache
+    ws = get_purchases_ws()
+    rows = ws.get_all_values()
+    now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(purchase_id):
+            ws.update(f"B{i+1}", [[new_status]])
+            ws.update(f"V{i+1}", [[now]])
+            _purchases_cache = None
+            return True
+    return False
+
+def update_purchase_details_by_id(purchase_id, requester_line_id, item_description, store_location,
+                                    auto_approve_limit_jpy, confirm_required_above_jpy,
+                                    spec_conditions, item_nature, notes):
+    global _purchases_cache
+    ws = get_purchases_ws()
+    rows = ws.get_all_values()
+    now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(purchase_id):
+            ws.update(f"H{i+1}:I{i+1}", [[requester_line_id, item_description]])
+            ws.update(f"M{i+1}:O{i+1}", [[store_location, auto_approve_limit_jpy, confirm_required_above_jpy]])
+            ws.update(f"P{i+1}:R{i+1}", [[spec_conditions, item_nature, notes]])
+            ws.update(f"V{i+1}", [[now]])
+            _purchases_cache = None
+            return True
+    return False
+
+def delete_purchase_by_id(purchase_id):
+    global _purchases_cache
+    ws = get_purchases_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(purchase_id):
+            ws.delete_rows(i + 1)
+            _purchases_cache = None
+            return True
+    return False
+
+def delete_all_purchases_for_agent(agent_discord_id):
+    global _purchases_cache
+    ws = get_purchases_ws()
+    rows = ws.get_all_values()
+    row_numbers = [i + 1 for i, row in enumerate(rows) if i > 0 and row and len(row) > 2 and row[2] == str(agent_discord_id)]
+    for row_number in reversed(row_numbers):
+        ws.delete_rows(row_number)
+    _purchases_cache = None
+    return len(row_numbers)
+
+# ==================== 代購行程資料讀寫（Google Sheets）====================
+def load_trips():
+    global _trips_cache
+    if _trips_cache is not None:
+        return _trips_cache
+    try:
+        ws = get_trips_ws()
+        rows = ws.get_all_values()
+        trips = []
+        for row in rows[1:]:
+            if row and row[0]:
+                trips.append({
+                    "agent_discord_id":   row[0],
+                    "agent_display_name": row[1] if len(row) > 1 else "",
+                    "itinerary_text":     row[2] if len(row) > 2 else "",
+                    "started_at":         row[3] if len(row) > 3 else "",
+                })
+        _trips_cache = trips
+        return _trips_cache
+    except Exception:
+        return []
+
+def get_trip_for_agent(agent_discord_id):
+    return next((t for t in load_trips() if t["agent_discord_id"] == str(agent_discord_id)), None)
+
+def set_trip(agent_discord_id, agent_display_name, itinerary_text):
+    global _trips_cache
+    ws = get_trips_ws()
+    rows = ws.get_all_values()
+    now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(agent_discord_id):
+            ws.update(f"A{i+1}:D{i+1}", [[str(agent_discord_id), agent_display_name, itinerary_text, now]])
+            _trips_cache = None
+            return
+    ws.append_row([str(agent_discord_id), agent_display_name, itinerary_text, now])
+    _trips_cache = None
+
+def clear_trip(agent_discord_id):
+    global _trips_cache
+    ws = get_trips_ws()
+    rows = ws.get_all_values()
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        if row and row[0] == str(agent_discord_id):
+            ws.delete_rows(i + 1)
+            _trips_cache = None
+            return True
+    return False
+
+def archive_purchases_to_history(purchases, trip):
+    if not purchases:
+        return
+    ws = get_trip_history_ws()
+    now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
+    itinerary_text = trip.get("itinerary_text", "") if trip else ""
+    trip_started_at = trip.get("started_at", "") if trip else ""
+    rows = [
+        [
+            p["id"], p["status"], p["agent_discord_id"], p["agent_display_name"], p["creation_source"],
+            p["requester_discord_id"], p["requester_display_name"], p["requester_line_id"],
+            p["item_description"], p["image_url_1"], p["image_url_2"], p["image_url_3"],
+            p["store_location"], p["auto_approve_limit_jpy"], p["confirm_required_above_jpy"],
+            p["spec_conditions"], p["item_nature"], p["notes"], p["acknowledged_risk"],
+            p["created_by_discord_id"], p["created_at"], p["updated_at"],
+            itinerary_text, trip_started_at, now,
+        ]
+        for p in purchases
+    ]
+    ws.append_rows(rows)
 
 # ==================== Bot 設定 ====================
 class MyBot(commands.Bot):
@@ -1317,12 +1526,14 @@ async def slash_purge(interaction: discord.Interaction):
 
 @bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台/餐盤回收區表格")
 async def slash_refresh(interaction: discord.Interaction):
-    global _triggers_cache
+    global _triggers_cache, _purchases_cache, _trips_cache
     await interaction.response.defer(ephemeral=True)
     _triggers_cache = None
+    _purchases_cache = None
+    _trips_cache = None
     await update_cashier_board()
     await update_recovery_board()
-    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！觸發詞快取也已清除。", ephemeral=True)
+    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！觸發詞、代購、行程快取也已清除。", ephemeral=True)
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
@@ -1988,6 +2199,744 @@ class AddReminderModal(discord.ui.Modal, title="新增每日提醒"):
 async def slash_daily_reminder(interaction: discord.Interaction):
     await interaction.response.send_message("⏰ 你想要新增還是刪除每日提醒？", view=ReminderActionView(), ephemeral=True)
 
+# ==================== 代購系統 ====================
+STATUS_LABELS = {
+    "pending": "⏳ 待處理",
+    "confirmed": "✅ 已確認可買",
+    "needs_confirmation": "❓ 需再確認",
+    "purchased": "🛍️ 已購買",
+    "cancelled": "❌ 已取消",
+}
+STATUS_COLORS = {
+    "pending": discord.Color.light_grey(),
+    "confirmed": discord.Color.blue(),
+    "needs_confirmation": discord.Color.orange(),
+    "purchased": discord.Color.green(),
+    "cancelled": discord.Color.red(),
+}
+_ACTIVE_PURCHASE_STATUSES = {"pending", "confirmed", "needs_confirmation"}
+
+def sort_purchases_for_queue(purchases):
+    return sorted(purchases, key=lambda p: (p["status"] not in _ACTIVE_PURCHASE_STATUSES, p["id"]))
+
+def _parse_jpy_amount(text, field_label):
+    text = text.strip()
+    if not text:
+        return 0, None
+    if not text.isdigit():
+        return None, f"「{field_label}」請輸入整數金額（日圓），你輸入的是：{text}"
+    return int(text), None
+
+def _format_location(location: str) -> str:
+    location = (location or "").strip()
+    if not location:
+        return "（未填寫）"
+    if location.lower().startswith(("http://", "https://")):
+        return f"[📍 開啟地圖／連結]({location})"
+    return location[:1024]
+
+def build_purchase_embed(p: dict) -> discord.Embed:
+    status = p.get("status", "pending")
+    embed = discord.Embed(
+        title=f"[{p['id']:03d}] {p['item_description'][:60]}",
+        color=STATUS_COLORS.get(status, discord.Color.light_grey()),
+    )
+    # 買到了沒、誰委託的、物品、規格、地點、價格區間放最前面，其餘次要資訊在後
+    embed.add_field(name="狀態", value=STATUS_LABELS.get(status, status), inline=True)
+    requester_line = p.get("requester_display_name") or "-"
+    if p.get("requester_line_id"):
+        requester_line += f"（LINE：{p['requester_line_id']}）"
+    embed.add_field(name="委託人", value=requester_line[:1024], inline=True)
+    embed.add_field(name="物品", value=(p.get("item_description") or "（未填寫）")[:1024], inline=False)
+    if p.get("spec_conditions"):
+        embed.add_field(name="尺寸/規格/顏色條件", value=p["spec_conditions"][:1024], inline=False)
+    embed.add_field(name="購買地點", value=_format_location(p.get("store_location")), inline=False)
+    threshold_lines = []
+    if p.get("auto_approve_limit_jpy"):
+        threshold_lines.append(f"低於 ¥{p['auto_approve_limit_jpy']:,} 可直接買")
+    if p.get("confirm_required_above_jpy"):
+        threshold_lines.append(f"超過 ¥{p['confirm_required_above_jpy']:,} 需先確認")
+    embed.add_field(name="金額門檻", value=("\n".join(threshold_lines) or "（未填寫）")[:1024], inline=False)
+    if p.get("item_nature"):
+        embed.add_field(name="物品性質", value=p["item_nature"][:1024], inline=False)
+    agent_value = f"<@{p['agent_discord_id']}>" if p.get("agent_discord_id") else p.get("agent_display_name", "-")
+    embed.add_field(name="代購人", value=agent_value, inline=True)
+    if p.get("notes"):
+        embed.add_field(name="備註", value=p["notes"][:1024], inline=False)
+    images = [u for u in [p.get("image_url_1"), p.get("image_url_2"), p.get("image_url_3")] if u]
+    if images:
+        embed.set_image(url=images[0])
+        if len(images) > 1:
+            embed.set_footer(text=f"🖼️ 尚有 {len(images) - 1} 張圖片，可用下方按鈕切換")
+    return embed
+
+class PurchaseDisclaimerView(discord.ui.View):
+    def __init__(self, context: dict):
+        super().__init__(timeout=120)
+        self.context = context
+
+    @discord.ui.button(label="✅ 我了解，繼續填寫 →", style=discord.ButtonStyle.primary)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PurchaseModalA(self.context))
+
+class PurchaseModalA(discord.ui.Modal, title="代購委託 (1/2) - 物品資訊"):
+    def __init__(self, context: dict):
+        super().__init__()
+        self.context = context
+        self.item_input = discord.ui.TextInput(
+            label="物品網址／圖片說明／名稱",
+            placeholder="例：https://example.com/item 或 手搖飲聯名杯",
+            style=discord.TextStyle.paragraph,
+        )
+        self.location_input = discord.ui.TextInput(
+            label="在哪裡買得到？",
+            placeholder="店名或 Google Map 連結",
+        )
+        self.spec_input = discord.ui.TextInput(
+            label="尺寸/規格/顏色—符合可直接買的條件（選填）",
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+        self.nature_input = discord.ui.TextInput(
+            label="物品性質（大件/重/液體等，選填）",
+            required=False,
+        )
+        self.add_item(self.item_input)
+        self.add_item(self.location_input)
+        self.add_item(self.spec_input)
+        self.add_item(self.nature_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.context["item_description"] = self.item_input.value.strip()
+        self.context["store_location"] = self.location_input.value.strip()
+        self.context["spec_conditions"] = self.spec_input.value.strip()
+        self.context["item_nature"] = self.nature_input.value.strip()
+        await interaction.response.send_modal(PurchaseModalB(self.context))
+
+class PurchaseModalB(discord.ui.Modal, title="代購委託 (2/2) - 金額與聯絡方式"):
+    def __init__(self, context: dict):
+        super().__init__()
+        self.context = context
+        self.no_confirm_input = discord.ui.TextInput(
+            label="不需確認、可直接買的金額上限（日圓，選填）",
+            placeholder="例：3000",
+            required=False,
+        )
+        self.confirm_input = discord.ui.TextInput(
+            label="超過多少日圓需要先問過才能買（選填）",
+            placeholder="例：10000",
+            required=False,
+        )
+        self.line_input = discord.ui.TextInput(
+            label=context["identity_label"],
+            placeholder="代購人知道你的LINE可留白；不知道的話請填入讓對方能聯絡你",
+            required=False,
+        )
+        self.notes_input = discord.ui.TextInput(
+            label="備註（選填）",
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+        self.add_item(self.no_confirm_input)
+        self.add_item(self.confirm_input)
+        self.add_item(self.line_input)
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        ctx = self.context
+        no_confirm_amount, err = _parse_jpy_amount(self.no_confirm_input.value, "不需確認金額上限")
+        if err:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
+            return
+        confirm_amount, err = _parse_jpy_amount(self.confirm_input.value, "需確認門檻")
+        if err:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
+            return
+        line_id = self.line_input.value.strip()
+        notes = self.notes_input.value.strip()
+
+        image_urls = await collect_purchase_images_via_dm(interaction)
+
+        new_id = add_purchase(
+            agent_discord_id=ctx["agent_discord_id"],
+            agent_display_name=ctx["agent_display_name"],
+            creation_source=ctx["creation_source"],
+            requester_discord_id=ctx["requester_discord_id"],
+            requester_display_name=ctx["requester_display_name"],
+            requester_line_id=line_id,
+            item_description=ctx["item_description"],
+            image_url_1=image_urls[0] if len(image_urls) > 0 else "",
+            image_url_2=image_urls[1] if len(image_urls) > 1 else "",
+            image_url_3=image_urls[2] if len(image_urls) > 2 else "",
+            store_location=ctx["store_location"],
+            auto_approve_limit_jpy=no_confirm_amount,
+            confirm_required_above_jpy=confirm_amount,
+            spec_conditions=ctx["spec_conditions"],
+            item_nature=ctx["item_nature"],
+            notes=notes,
+            created_by_discord_id=ctx["created_by_discord_id"],
+        )
+        preview = {
+            "id": new_id, "status": "pending",
+            "agent_discord_id": ctx["agent_discord_id"], "agent_display_name": ctx["agent_display_name"],
+            "requester_display_name": ctx["requester_display_name"], "requester_line_id": line_id,
+            "item_description": ctx["item_description"],
+            "image_url_1": image_urls[0] if len(image_urls) > 0 else "",
+            "image_url_2": image_urls[1] if len(image_urls) > 1 else "",
+            "image_url_3": image_urls[2] if len(image_urls) > 2 else "",
+            "store_location": ctx["store_location"],
+            "auto_approve_limit_jpy": no_confirm_amount, "confirm_required_above_jpy": confirm_amount,
+            "spec_conditions": ctx["spec_conditions"], "item_nature": ctx["item_nature"], "notes": notes,
+        }
+        await interaction.followup.send(
+            f"✅ **委託 [{new_id:03d}] 已送出給 {ctx['agent_display_name']}！**",
+            embed=build_purchase_embed(preview),
+            ephemeral=True,
+        )
+
+class SkipImagesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=90)
+
+    @discord.ui.button(label="🚀 不用附圖，直接送出", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="好的，直接送出目前的委託內容。", view=None)
+        self.stop()
+
+async def collect_purchase_images_via_dm(interaction: discord.Interaction, max_images: int = 3, timeout: int = 90) -> list:
+    skip_view = SkipImagesView()
+    await interaction.followup.send(
+        f"📷 要附上圖片嗎？請直接私訊（DM）我並附上圖片，最多 {max_images} 張（電腦可直接 Ctrl+V 貼上截圖，手機可選相簿），"
+        f"{timeout} 秒內傳送即可，可以分多則訊息傳送。不需要圖片的話直接按下方按鈕送出委託。",
+        view=skip_view,
+        ephemeral=True,
+    )
+    collected = []
+
+    def check_dm(m: discord.Message) -> bool:
+        return m.author.id == interaction.user.id and isinstance(m.channel, discord.DMChannel) and bool(m.attachments)
+
+    while len(collected) < max_images:
+        msg_task = asyncio.create_task(bot.wait_for("message", check=check_dm, timeout=timeout))
+        skip_task = asyncio.create_task(skip_view.wait())
+        done, pending = await asyncio.wait({msg_task, skip_task}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        if skip_task in done:
+            break
+        try:
+            message = msg_task.result()
+        except asyncio.TimeoutError:
+            break
+        for att in message.attachments:
+            if len(collected) >= max_images:
+                break
+            try:
+                collected.append(await upload_to_imgbb(att))
+            except Exception:
+                pass
+        try:
+            await message.add_reaction("✅")
+        except discord.HTTPException:
+            pass
+    return collected
+
+class PurchaseActionView(discord.ui.View):
+    def __init__(self, purchase: dict):
+        super().__init__(timeout=180)
+        self.purchase = purchase
+        self.image_urls = [u for u in [purchase.get("image_url_1"), purchase.get("image_url_2"), purchase.get("image_url_3")] if u]
+        self.image_index = 0
+        if len(self.image_urls) <= 1:
+            self.remove_item(self.cycle_image)
+
+    def _can_act(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == int(self.purchase["agent_discord_id"] or 0)
+
+    async def _set_status(self, interaction: discord.Interaction, status: str, label: str):
+        if not self._can_act(interaction):
+            await interaction.response.send_message("❌ 只有指定的代購人能操作，這份委託只有你自己看得到", ephemeral=True)
+            return
+        if not update_purchase_status_by_id(self.purchase["id"], status):
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {self.purchase['id']:03d}，可能已被刪除", embed=None, view=None)
+            return
+        self.purchase["status"] = status
+        await interaction.response.edit_message(content=label, embed=build_purchase_embed(self.purchase), view=self)
+
+    @discord.ui.button(label="✅ 確認可買", style=discord.ButtonStyle.primary, row=0)
+    async def mark_confirmed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "confirmed", f"✅ [{self.purchase['id']:03d}] 已標記為確認可買")
+
+    @discord.ui.button(label="❓ 需再確認", style=discord.ButtonStyle.secondary, row=0)
+    async def mark_needs_confirmation(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "needs_confirmation", f"❓ [{self.purchase['id']:03d}] 已標記為需再確認")
+
+    @discord.ui.button(label="🛍️ 已購買", style=discord.ButtonStyle.success, row=0)
+    async def mark_purchased(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "purchased", f"🛍️ [{self.purchase['id']:03d}] 已標記為已購買")
+
+    @discord.ui.button(label="❌ 取消", style=discord.ButtonStyle.danger, row=0)
+    async def mark_cancelled(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_status(interaction, "cancelled", f"❌ [{self.purchase['id']:03d}] 已標記為取消")
+
+    @discord.ui.button(label="🗑️ 刪除紀錄", style=discord.ButtonStyle.danger, row=1)
+    async def delete_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can_act(interaction):
+            await interaction.response.send_message("❌ 只有指定的代購人能操作，這份委託只有你自己看得到", ephemeral=True)
+            return
+        if delete_purchase_by_id(self.purchase["id"]):
+            await interaction.response.edit_message(content=f"🗑️ 已刪除委託 [{self.purchase['id']:03d}]", embed=None, view=None)
+        else:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {self.purchase['id']:03d}，可能已被刪除", embed=None, view=None)
+
+    @discord.ui.button(label="🖼️ 換圖", style=discord.ButtonStyle.secondary, row=1)
+    async def cycle_image(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.image_index = (self.image_index + 1) % len(self.image_urls)
+        embed = build_purchase_embed(self.purchase)
+        embed.set_image(url=self.image_urls[self.image_index])
+        embed.set_footer(text=f"🖼️ 第 {self.image_index + 1}/{len(self.image_urls)} 張圖片")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+PURCHASE_PAGE_SIZE = 25
+
+class PurchaseQueueView(discord.ui.View):
+    def __init__(self, purchases: list, page: int = 0):
+        super().__init__(timeout=180)
+        self.purchases = purchases
+        self.page = page
+        self.max_page = max(0, (len(purchases) - 1) // PURCHASE_PAGE_SIZE)
+
+        page_items = purchases[page * PURCHASE_PAGE_SIZE:(page + 1) * PURCHASE_PAGE_SIZE]
+        select = discord.ui.Select(
+            placeholder=f"選擇委託查看詳情（第 {page + 1}/{self.max_page + 1} 頁）",
+            options=[
+                discord.SelectOption(
+                    label=f"[{p['id']:03d}] {p['item_description'][:80]}",
+                    description=f"{STATUS_LABELS.get(p['status'], p['status'])}｜{p['requester_display_name'][:40]}",
+                    value=str(p["id"]),
+                )
+                for p in page_items
+            ],
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+        prev_button = discord.ui.Button(label="⬅ 上一頁", style=discord.ButtonStyle.secondary, disabled=(page <= 0))
+        prev_button.callback = self.prev_page
+        self.add_item(prev_button)
+
+        next_button = discord.ui.Button(label="➡ 下一頁", style=discord.ButtonStyle.secondary, disabled=(page >= self.max_page))
+        next_button.callback = self.next_page
+        self.add_item(next_button)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        pid = int(interaction.data["values"][0])
+        purchase = next((p for p in self.purchases if p["id"] == pid), None)
+        if not purchase:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {pid:03d}，可能已被刪除", embed=None, view=None)
+            return
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_purchase_embed(purchase),
+            view=PurchaseActionView(purchase),
+        )
+
+    async def prev_page(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=PurchaseQueueView(self.purchases, self.page - 1))
+
+    async def next_page(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=PurchaseQueueView(self.purchases, self.page + 1))
+
+@bot.tree.command(name="代購委託", description="委託代購：可以委託給自己，也能幫別人登記")
+@app_commands.describe(
+    代購人="要委託的代購人",
+    委託人稱呼="留空＝幫自己委託；填寫＝幫別人登記（不論在不在群組內）",
+)
+async def slash_purchase_request(
+    interaction: discord.Interaction,
+    代購人: discord.Member,
+    委託人稱呼: str = None,
+):
+    is_proxy = bool(委託人稱呼 and 委託人稱呼.strip())
+    requester_name = 委託人稱呼.strip() if is_proxy else interaction.user.display_name
+    identity_label = f"{requester_name[:15]} 的 LINE ID" if is_proxy else "你的 LINE ID"
+    context = {
+        "agent_discord_id": str(代購人.id),
+        "agent_display_name": 代購人.display_name,
+        "creation_source": "proxy" if is_proxy else "self",
+        "requester_discord_id": "" if is_proxy else str(interaction.user.id),
+        "requester_display_name": requester_name,
+        "identity_label": identity_label,
+        "created_by_discord_id": str(interaction.user.id),
+    }
+    trip = get_trip_for_agent(代購人.id)
+    trip_line = f"📍 {代購人.display_name} 目前行程：{trip['itinerary_text']}\n" if trip else f"⚠️ {代購人.display_name} 目前沒有登記行程，請自行確認對方是否方便代購。\n"
+    await interaction.response.send_message(
+        f"📝 **代購委託 — 委託給 {代購人.mention}**\n"
+        f"　委託人：{requester_name}\n"
+        f"{trip_line}"
+        "⚠️ 代購人會盡力幫忙，但不一定能買到，請見諒！\n"
+        "請按下方按鈕繼續填寫委託內容：",
+        view=PurchaseDisclaimerView(context),
+        ephemeral=True,
+    )
+
+class EditPurchaseModalA(discord.ui.Modal, title="修改委託 (1/2) - 物品資訊"):
+    def __init__(self, purchase: dict):
+        super().__init__()
+        self.purchase_id = purchase["id"]
+        self.existing = purchase
+        self.item_input = discord.ui.TextInput(
+            label="物品網址／圖片說明／名稱",
+            default=purchase["item_description"],
+            style=discord.TextStyle.paragraph,
+        )
+        self.location_input = discord.ui.TextInput(
+            label="在哪裡買得到？",
+            default=purchase["store_location"],
+        )
+        self.spec_input = discord.ui.TextInput(
+            label="尺寸/規格/顏色—符合可直接買的條件（選填）",
+            default=purchase["spec_conditions"],
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+        self.nature_input = discord.ui.TextInput(
+            label="物品性質（大件/重/液體等，選填）",
+            default=purchase["item_nature"],
+            required=False,
+        )
+        self.add_item(self.item_input)
+        self.add_item(self.location_input)
+        self.add_item(self.spec_input)
+        self.add_item(self.nature_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.existing["item_description"] = self.item_input.value.strip()
+        self.existing["store_location"] = self.location_input.value.strip()
+        self.existing["spec_conditions"] = self.spec_input.value.strip()
+        self.existing["item_nature"] = self.nature_input.value.strip()
+        await interaction.response.send_modal(EditPurchaseModalB(self.existing))
+
+class EditPurchaseModalB(discord.ui.Modal, title="修改委託 (2/2) - 金額與聯絡方式"):
+    def __init__(self, purchase: dict):
+        super().__init__()
+        self.purchase_id = purchase["id"]
+        self.existing = purchase
+        self.no_confirm_input = discord.ui.TextInput(
+            label="不需確認、可直接買的金額上限（日圓，選填）",
+            default=str(purchase.get("auto_approve_limit_jpy") or ""),
+            required=False,
+        )
+        self.confirm_input = discord.ui.TextInput(
+            label="超過多少日圓需要先問過才能買（選填）",
+            default=str(purchase.get("confirm_required_above_jpy") or ""),
+            required=False,
+        )
+        self.line_input = discord.ui.TextInput(
+            label="LINE ID（選填）",
+            default=purchase.get("requester_line_id", ""),
+            placeholder="代購人知道你的LINE可留白；不知道的話請填入讓對方能聯絡你",
+            required=False,
+        )
+        self.notes_input = discord.ui.TextInput(
+            label="備註（選填）",
+            default=purchase.get("notes", ""),
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+        self.add_item(self.no_confirm_input)
+        self.add_item(self.confirm_input)
+        self.add_item(self.line_input)
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        no_confirm_amount, err = _parse_jpy_amount(self.no_confirm_input.value, "不需確認金額上限")
+        if err:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
+            return
+        confirm_amount, err = _parse_jpy_amount(self.confirm_input.value, "需確認門檻")
+        if err:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
+            return
+        line_id = self.line_input.value.strip()
+        notes = self.notes_input.value.strip()
+        ok = update_purchase_details_by_id(
+            self.purchase_id,
+            requester_line_id=line_id,
+            item_description=self.existing["item_description"],
+            store_location=self.existing["store_location"],
+            auto_approve_limit_jpy=no_confirm_amount,
+            confirm_required_above_jpy=confirm_amount,
+            spec_conditions=self.existing["spec_conditions"],
+            item_nature=self.existing["item_nature"],
+            notes=notes,
+        )
+        if not ok:
+            await interaction.followup.send(f"❌ 找不到編號 {self.purchase_id:03d}，可能已被刪除", ephemeral=True)
+            return
+        preview = dict(self.existing)
+        preview["requester_line_id"] = line_id
+        preview["notes"] = notes
+        preview["auto_approve_limit_jpy"] = no_confirm_amount
+        preview["confirm_required_above_jpy"] = confirm_amount
+        await interaction.followup.send(
+            f"✏️ **委託 [{self.purchase_id:03d}] 已修改**",
+            embed=build_purchase_embed(preview),
+            ephemeral=True,
+        )
+
+class RequesterActionView(discord.ui.View):
+    def __init__(self, purchase: dict):
+        super().__init__(timeout=180)
+        self.purchase = purchase
+
+    def _can_act(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == int(self.purchase["requester_discord_id"] or 0)
+
+    @discord.ui.button(label="✏️ 修改", style=discord.ButtonStyle.primary)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can_act(interaction):
+            await interaction.response.send_message("❌ 只有委託人本人能修改，這份委託只有你自己看得到", ephemeral=True)
+            return
+        fresh = next((p for p in load_purchases() if p["id"] == self.purchase["id"]), None)
+        if not fresh:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {self.purchase['id']:03d}，可能已被刪除", embed=None, view=None)
+            return
+        await interaction.response.send_modal(EditPurchaseModalA(fresh))
+
+    @discord.ui.button(label="🗑️ 刪除委託", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._can_act(interaction):
+            await interaction.response.send_message("❌ 只有委託人本人能刪除，這份委託只有你自己看得到", ephemeral=True)
+            return
+        if delete_purchase_by_id(self.purchase["id"]):
+            await interaction.response.edit_message(content=f"🗑️ 已刪除委託 [{self.purchase['id']:03d}]", embed=None, view=None)
+        else:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {self.purchase['id']:03d}，可能已被刪除", embed=None, view=None)
+
+REQUESTER_PAGE_SIZE = 25
+
+class RequesterQueueView(discord.ui.View):
+    def __init__(self, purchases: list, page: int = 0):
+        super().__init__(timeout=180)
+        self.purchases = purchases
+        self.page = page
+        self.max_page = max(0, (len(purchases) - 1) // REQUESTER_PAGE_SIZE)
+
+        page_items = purchases[page * REQUESTER_PAGE_SIZE:(page + 1) * REQUESTER_PAGE_SIZE]
+        select = discord.ui.Select(
+            placeholder=f"選擇委託查看詳情（第 {page + 1}/{self.max_page + 1} 頁）",
+            options=[
+                discord.SelectOption(
+                    label=f"[{p['id']:03d}] {p['item_description'][:80]}",
+                    description=f"{STATUS_LABELS.get(p['status'], p['status'])}｜代購人：{p['agent_display_name'][:40]}",
+                    value=str(p["id"]),
+                )
+                for p in page_items
+            ],
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+        prev_button = discord.ui.Button(label="⬅ 上一頁", style=discord.ButtonStyle.secondary, disabled=(page <= 0))
+        prev_button.callback = self.prev_page
+        self.add_item(prev_button)
+
+        next_button = discord.ui.Button(label="➡ 下一頁", style=discord.ButtonStyle.secondary, disabled=(page >= self.max_page))
+        next_button.callback = self.next_page
+        self.add_item(next_button)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        pid = int(interaction.data["values"][0])
+        purchase = next((p for p in self.purchases if p["id"] == pid), None)
+        if not purchase:
+            await interaction.response.edit_message(content=f"❌ 找不到編號 {pid:03d}，可能已被刪除", embed=None, view=None)
+            return
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_purchase_embed(purchase),
+            view=RequesterActionView(purchase),
+        )
+
+    async def prev_page(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=RequesterQueueView(self.purchases, self.page - 1))
+
+    async def next_page(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=RequesterQueueView(self.purchases, self.page + 1))
+
+class PurchaseProgressModeView(discord.ui.View):
+    def __init__(self, as_agent: list, as_requester: list):
+        super().__init__(timeout=120)
+        self.as_agent = as_agent
+        self.as_requester = as_requester
+
+    @discord.ui.button(label="🛍️ 別人請我買的", style=discord.ButtonStyle.primary)
+    async def show_agent(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"🛍️ **你的代購清單**（別人請你買的，共 {len(self.as_agent)} 筆，只有你自己看得到）",
+            view=PurchaseQueueView(self.as_agent),
+        )
+
+    @discord.ui.button(label="📋 我請別人買的", style=discord.ButtonStyle.secondary)
+    async def show_requester(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"📋 **你委託出去的代購**（你請別人買的，共 {len(self.as_requester)} 筆，只有你自己看得到）",
+            view=RequesterQueueView(self.as_requester),
+        )
+
+@bot.tree.command(name="代購進度", description="查看代購相關委託：別人請你買的、或你請別人買的都在這裡")
+async def slash_purchase_progress(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    all_purchases = load_purchases()
+    as_agent = sort_purchases_for_queue([p for p in all_purchases if p["agent_discord_id"] == str(interaction.user.id)])
+    as_requester = sort_purchases_for_queue([p for p in all_purchases if p["requester_discord_id"] == str(interaction.user.id)])
+
+    if not as_agent and not as_requester:
+        await interaction.followup.send("📭 你目前沒有任何代購相關紀錄。", ephemeral=True)
+        return
+    if as_agent and not as_requester:
+        await interaction.followup.send(
+            f"🛍️ **你的代購清單**（別人請你買的，共 {len(as_agent)} 筆，只有你自己看得到）",
+            view=PurchaseQueueView(as_agent),
+            ephemeral=True,
+        )
+        return
+    if as_requester and not as_agent:
+        await interaction.followup.send(
+            f"📋 **你委託出去的代購**（你請別人買的，共 {len(as_requester)} 筆，只有你自己看得到）",
+            view=RequesterQueueView(as_requester),
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        "📦 你同時有兩種代購紀錄，想先看哪一種？（幫別人代填登記的委託不會出現在「我請別人買的」，因為系統沒有那個人的 Discord 身份可以核對）",
+        view=PurchaseProgressModeView(as_agent, as_requester),
+        ephemeral=True,
+    )
+
+class TripSetModal(discord.ui.Modal, title="設定我的代購行程"):
+    def __init__(self, existing_text: str = ""):
+        super().__init__()
+        self.itinerary_input = discord.ui.TextInput(
+            label="行程說明（讓委託人知道你要去哪）",
+            placeholder="例：7/20-7/25 大阪、京都",
+            style=discord.TextStyle.paragraph,
+            default=existing_text,
+        )
+        self.add_item(self.itinerary_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.itinerary_input.value.strip()
+        set_trip(str(interaction.user.id), interaction.user.display_name, text)
+        await interaction.response.send_message(
+            f"📍 行程已更新：{text}\n之後別人委託你代購時就會看到這段說明。",
+            ephemeral=True,
+        )
+
+class TripEndConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="⚠️ 確認結束並清空，無法復原", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        agent_id = str(interaction.user.id)
+        trip = get_trip_for_agent(agent_id)
+        purchases = [p for p in load_purchases() if p["agent_discord_id"] == agent_id]
+        archive_purchases_to_history(purchases, trip)
+        deleted = delete_all_purchases_for_agent(agent_id)
+        clear_trip(agent_id)
+        await interaction.response.edit_message(
+            content=f"🏁 行程已結束，共 {deleted} 筆委託已歸檔至歷史紀錄並從你的清單移除（不會再顯示在 `/代購進度`）。",
+            view=None,
+        )
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="已取消，行程與委託維持不變。", view=None)
+
+class TripActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.action = "start"
+        select = discord.ui.Select(placeholder="你想要...", options=[
+            discord.SelectOption(label="📍 開始／更新行程", value="start", default=True),
+            discord.SelectOption(label="🏁 結束行程並清空這趟所有委託", value="end"),
+        ])
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        self.action = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="下一步 →", style=discord.ButtonStyle.primary, row=1)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.action == "start":
+            existing = get_trip_for_agent(interaction.user.id)
+            await interaction.response.send_modal(TripSetModal(existing["itinerary_text"] if existing else ""))
+        else:
+            trip = get_trip_for_agent(interaction.user.id)
+            if not trip:
+                await interaction.response.edit_message(content="⚠️ 你目前沒有登記中的行程。", view=None)
+                return
+            count = len([p for p in load_purchases() if p["agent_discord_id"] == str(interaction.user.id)])
+            await interaction.response.edit_message(
+                content=(
+                    f"⚠️ **確定要結束行程嗎？**\n"
+                    f"目前行程：{trip['itinerary_text'][:200]}\n"
+                    f"這趟共 {count} 筆委託（不分狀態）將會從 `/代購進度` 移除、歸檔到歷史紀錄，之後不會再顯示在清單裡。"
+                ),
+                view=TripEndConfirmView(),
+            )
+
+@bot.tree.command(name="代購行程", description="設定你目前的代購行程，或結束行程並清空這趟所有委託")
+async def slash_trip(interaction: discord.Interaction):
+    await interaction.response.send_message("📍 你想要開始／更新行程，還是結束行程？", view=TripActionView(), ephemeral=True)
+
+@bot.tree.command(name="代購強制刪除", description="管理員緊急清空某位代購人名下所有委託（不會顯示物品內容，僅供代購人失聯等情況使用）")
+@app_commands.describe(代購人ID="代購人的 Discord 使用者 ID（純數字，開發者模式右鍵複製，即使對方已離開群組也能用）")
+async def slash_purchase_force_delete(interaction: discord.Interaction, 代購人ID: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
+        return
+    agent_id = 代購人ID.strip()
+    if not agent_id.isdigit():
+        await interaction.response.send_message("❌ 代購人ID 必須是純數字的 Discord 使用者 ID", ephemeral=True)
+        return
+    count = len([p for p in load_purchases() if p["agent_discord_id"] == agent_id])
+    if count == 0:
+        await interaction.response.send_message(f"📭 ID `{agent_id}` 名下目前沒有任何委託。", ephemeral=True)
+        return
+    try:
+        user = await bot.fetch_user(int(agent_id))
+        name_hint = f"（{user.display_name}）"
+    except (discord.NotFound, discord.HTTPException, ValueError):
+        name_hint = "（無法取得使用者名稱）"
+    await interaction.response.send_message(
+        f"⚠️ 確定要強制清空 ID `{agent_id}` {name_hint} 名下**所有 {count} 筆**委託嗎？\n"
+        "這裡不會顯示委託內容，此動作僅供代購人失聯等緊急情況使用，會直接刪除、不會歸檔到歷史紀錄，無法復原。",
+        view=PurchaseForceDeleteConfirmView(agent_id),
+        ephemeral=True,
+    )
+
+class PurchaseForceDeleteConfirmView(discord.ui.View):
+    def __init__(self, agent_id: str):
+        super().__init__(timeout=60)
+        self.agent_id = agent_id
+
+    @discord.ui.button(label="⚠️ 確認強制清空", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        deleted = delete_all_purchases_for_agent(self.agent_id)
+        clear_trip(self.agent_id)
+        await interaction.response.edit_message(content=f"🗑️ 已強制清空 ID `{self.agent_id}` 名下共 {deleted} 筆委託。", view=None)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="已取消。", view=None)
+
 # ==================== 每日播報（匯率 + 美股）====================
 NOTIFY_CHANNEL_ID = 472053843367297026
 JPY_THRESHOLD = 0.198
@@ -2099,8 +3048,8 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 檢查是否包含關鍵字
-    if any(kw in message.content for kw in KEYWORDS):
+    # 檢查是否包含關鍵字（私訊沒有 guild，略過）
+    if message.guild and any(kw in message.content for kw in KEYWORDS):
         role = message.guild.get_role(ROLE_ID)
         if role:
             await message.channel.send(f"🍽️ 有人要請客！{role.mention} 快來！")
