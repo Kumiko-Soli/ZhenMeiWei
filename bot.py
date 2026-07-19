@@ -2202,19 +2202,15 @@ async def slash_daily_reminder(interaction: discord.Interaction):
 # ==================== 代購系統 ====================
 STATUS_LABELS = {
     "pending": "⏳ 待處理",
-    "confirmed": "✅ 已確認可買",
-    "needs_confirmation": "❓ 需再確認",
     "purchased": "🛍️ 已購買",
-    "cancelled": "❌ 已取消",
+    "cancelled": "❌ 無法買到",
 }
 STATUS_COLORS = {
     "pending": discord.Color.light_grey(),
-    "confirmed": discord.Color.blue(),
-    "needs_confirmation": discord.Color.orange(),
     "purchased": discord.Color.green(),
     "cancelled": discord.Color.red(),
 }
-_ACTIVE_PURCHASE_STATUSES = {"pending", "confirmed", "needs_confirmation"}
+_ACTIVE_PURCHASE_STATUSES = {"pending"}
 
 def sort_purchases_for_queue(purchases):
     return sorted(purchases, key=lambda p: (p["status"] not in _ACTIVE_PURCHASE_STATUSES, p["id"]))
@@ -2477,21 +2473,13 @@ class PurchaseActionView(discord.ui.View):
         self.purchase["status"] = status
         await interaction.response.edit_message(content=label, embed=build_purchase_embed(self.purchase), view=self)
 
-    @discord.ui.button(label="✅ 確認可買", style=discord.ButtonStyle.primary, row=0)
-    async def mark_confirmed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._set_status(interaction, "confirmed", f"✅ [{self.purchase['id']:03d}] 已標記為確認可買")
-
-    @discord.ui.button(label="❓ 需再確認", style=discord.ButtonStyle.secondary, row=0)
-    async def mark_needs_confirmation(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._set_status(interaction, "needs_confirmation", f"❓ [{self.purchase['id']:03d}] 已標記為需再確認")
-
     @discord.ui.button(label="🛍️ 已購買", style=discord.ButtonStyle.success, row=0)
     async def mark_purchased(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._set_status(interaction, "purchased", f"🛍️ [{self.purchase['id']:03d}] 已標記為已購買")
 
-    @discord.ui.button(label="❌ 取消", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label="❌ 無法買到", style=discord.ButtonStyle.danger, row=0)
     async def mark_cancelled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._set_status(interaction, "cancelled", f"❌ [{self.purchase['id']:03d}] 已標記為取消")
+        await self._set_status(interaction, "cancelled", f"❌ [{self.purchase['id']:03d}] 已標記為無法買到")
 
     @discord.ui.button(label="🗑️ 刪除紀錄", style=discord.ButtonStyle.danger, row=1)
     async def delete_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
