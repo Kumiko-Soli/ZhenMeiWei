@@ -5,7 +5,10 @@ import base64
 import random
 import re
 import asyncio
-from datetime import datetime
+import hashlib
+import contextvars
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
 import discord
@@ -13,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 import gspread
 from google.oauth2.service_account import Credentials
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from discord.ext import tasks
 import pytz
@@ -41,41 +45,193 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# ==================== Google Sheets 連線 ====================
-_sheets_client = None
-_spreadsheet = None
-_config_cache = None
-_members_cache = None
-_triggers_cache = None
-_purchases_cache = None
-_trips_cache = None
+# ==================== 多伺服器：每個伺服器各自的試算表 ====================
+# 每個伺服器的資料（帳目、成員、觸發詞、提醒、代購、頻道設定）都存在「那個伺服器自己的」Google 試算表，
+# 並且用「那個伺服器自己的」服務帳號金鑰存取（所以用的是他們自己的 Google API 額度）。
+#   • 主伺服器（機器人擁有者的伺服器）：試算表與金鑰來自環境變數，跟以前一樣。
+#   • 其他伺服器：管理員用 /管理者工具 → 設定試算表 自行綁定；
+#     綁定資料（金鑰加密後）存在主試算表的 guilds 分頁。
+#
+# 所有資料讀寫函式都透過 _st() 取得「目前這個互動／訊息所屬伺服器」的狀態。
+# 沒有伺服器脈絡時 _st() 會直接丟例外，絕對不會默默退回去用主伺服器的試算表。
+GUILD_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SHEETS_TIMEOUT_SECONDS = 20
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
-def get_sheets_client():
-    global _sheets_client
-    if _sheets_client is not None:
-        return _sheets_client
+class GuildNotBound(Exception):
+    """沒有伺服器脈絡，或這個伺服器還沒綁定試算表。"""
+
+def load_home_credentials():
     b64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
     if b64:
         creds_json = json.loads(base64.b64decode(b64).decode("utf-8"))
-        creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-    _sheets_client = gspread.authorize(creds)
-    return _sheets_client
+        return Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+    return Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+
+class GuildState:
+    """一個伺服器的試算表連線與快取。"""
+    def __init__(self, guild_id, sheet_id, credentials_info=None, service_account_email="", is_home=False):
+        self.guild_id = guild_id
+        self.sheet_id = sheet_id
+        self.is_home = is_home
+        self.service_account_email = service_account_email
+        self._credentials_info = credentials_info   # 主伺服器是 None，改讀環境變數
+        self._client = None
+        self._spreadsheet = None
+        self.time_checked = False
+        self.clear_caches()
+
+    def clear_caches(self):
+        self.config_cache = None
+        self.members_cache = None
+        self.triggers_cache = None
+        self.purchases_cache = None
+        self.trips_cache = None
+
+    def reset_connection(self):
+        self._spreadsheet = None
+
+    def label(self) -> str:
+        if self.is_home:
+            return "主伺服器"
+        guild = bot.get_guild(self.guild_id)
+        return f"{guild.name}（{self.guild_id}）" if guild else f"伺服器 {self.guild_id}"
+
+    def client(self):
+        if self._client is None:
+            if self.is_home:
+                creds = load_home_credentials()
+            else:
+                creds = Credentials.from_service_account_info(self._credentials_info, scopes=GUILD_SCOPES)
+            self._client = gspread.authorize(creds)
+            # 沒有逾時的話，某一個伺服器的試算表卡住會讓整個機器人跟著卡住
+            self._client.set_timeout(SHEETS_TIMEOUT_SECONDS)
+        return self._client
+
+    def spreadsheet(self):
+        if self._spreadsheet is None:
+            if not self.sheet_id:
+                raise ValueError("尚未設定 GOOGLE_SHEET_ID 環境變數")
+            self._spreadsheet = self.client().open_by_key(self.sheet_id)
+        return self._spreadsheet
+
+_home_state = GuildState(None, os.getenv("GOOGLE_SHEET_ID", ""), is_home=True)   # guild_id 上線後才知道
+_guild_states = {}          # guild_id -> GuildState（主伺服器以外、已綁定的伺服器）
+_startup_done = False
+_bindings_loaded = False
+_guild_ctx = contextvars.ContextVar("guild_state", default=None)
+
+def state_for_guild(guild_id):
+    """這個伺服器的狀態；還沒綁定試算表的伺服器回傳 None。"""
+    if guild_id is None:
+        return None
+    if _home_state.guild_id is not None and guild_id == _home_state.guild_id:
+        return _home_state
+    return _guild_states.get(guild_id)
+
+def all_states() -> list:
+    states = list(_guild_states.values())
+    if _home_state.guild_id is not None:
+        states.insert(0, _home_state)
+    return states
+
+def _st() -> GuildState:
+    """目前這個互動／訊息所屬伺服器的狀態。"""
+    state = _guild_ctx.get()
+    if state is None:
+        raise GuildNotBound("沒有伺服器脈絡：這段程式沒有先確定是哪個伺服器就讀寫資料")
+    return state
 
 def get_spreadsheet():
-    global _spreadsheet
-    if _spreadsheet is not None:
-        return _spreadsheet
-    sheet_id = os.getenv("GOOGLE_SHEET_ID", "")
-    if not sheet_id:
-        raise ValueError("尚未設定 GOOGLE_SHEET_ID 環境變數")
-    _spreadsheet = get_sheets_client().open_by_key(sheet_id)
-    return _spreadsheet
+    return _st().spreadsheet()
+
+# ---- 時間：試算表裡一律存台灣時間 ----
+TIME_STORAGE_KEY = "time_storage"
+
+def _utc_text_to_taipei(text: str):
+    """把舊的 UTC 時間字串加 8 小時；不是標準格式的回傳 None（不去動它）。"""
+    try:
+        naive = datetime.strptime(text.strip(), TIME_FORMAT)
+    except ValueError:
+        return None
+    return (naive + timedelta(hours=8)).strftime(TIME_FORMAT)
+
+def _time_shift_requests(ws, rows, column_index: int) -> list:
+    """產生「把某一欄（第 2 列起）從 UTC 改成台灣時間」的 updateCells 請求；連續的列合併成一個請求。"""
+    requests, run_start, run_values = [], None, []
+
+    def flush():
+        nonlocal run_start, run_values
+        if run_values:
+            requests.append({"updateCells": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": run_start, "endRowIndex": run_start + len(run_values),
+                    "startColumnIndex": column_index, "endColumnIndex": column_index + 1,
+                },
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}]} for value in run_values],
+                "fields": "userEnteredValue",
+            }})
+        run_start, run_values = None, []
+
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        shifted = _utc_text_to_taipei(row[column_index]) if len(row) > column_index else None
+        if shifted is None:
+            flush()
+            continue
+        if run_start is None:
+            run_start = i
+        run_values.append(shifted)
+    flush()
+    return requests
+
+def ensure_time_storage():
+    """expense／history 的時間以前存的是 UTC，現在一律存台灣時間。
+    每份試算表只會轉換一次：把舊資料全部加 8 小時，並在 config 寫下 time_storage=taipei 當記號。
+    轉換和記號包在同一個 batchUpdate 裡（全有或全無），不會轉到一半，也不會重複加兩次。"""
+    state = _st()
+    if state.time_checked:
+        return
+    ss = get_spreadsheet()
+    config_ws = ss.worksheet("config")
+    # 這裡故意不用 load_config()：它讀取失敗時會回傳預設值，會被誤判成「還沒轉換過」而重複加 8 小時
+    config_rows = config_ws.get_all_values()
+    if any(row and row[0] == TIME_STORAGE_KEY for row in config_rows):
+        state.time_checked = True
+        return
+    expense_ws, history_ws = ss.worksheet("expense"), ss.worksheet("history")
+    expense_rows, history_rows = expense_ws.get_all_values(), history_ws.get_all_values()
+    requests = []
+    requests += _time_shift_requests(expense_ws, expense_rows, 1)   # time
+    requests += _time_shift_requests(history_ws, history_rows, 1)   # record_time
+    requests += _time_shift_requests(history_ws, history_rows, 2)   # clear_time
+    flag_row = len(config_rows)     # config 第一個空白列（0 起算）
+    if flag_row >= config_ws.row_count:
+        requests.append({"appendDimension": {"sheetId": config_ws.id, "dimension": "ROWS", "length": 1}})
+    requests.append({"updateCells": {
+        "range": {
+            "sheetId": config_ws.id,
+            "startRowIndex": flag_row, "endRowIndex": flag_row + 1,
+            "startColumnIndex": 0, "endColumnIndex": 2,
+        },
+        "rows": [{"values": [
+            {"userEnteredValue": {"stringValue": TIME_STORAGE_KEY}},
+            {"userEnteredValue": {"stringValue": "taipei"}},
+        ]}],
+        "fields": "userEnteredValue",
+    }})
+    ss.batch_update({"requests": requests})
+    state.config_cache = None
+    state.time_checked = True
+    print(f"🕗 {state.label()}：expense {max(len(expense_rows) - 1, 0)} 列、history {max(len(history_rows) - 1, 0)} 列的時間已從 UTC 轉成台灣時間")
 
 def get_worksheets():
+    ensure_time_storage()
     ss = get_spreadsheet()
     return ss.worksheet("expense"), ss.worksheet("history")
 
@@ -100,11 +256,196 @@ def get_trips_ws():
 def get_trip_history_ws():
     return get_spreadsheet().worksheet("trip_history")
 
+# ==================== 其他伺服器的綁定資料（存在主試算表的 guilds 分頁）====================
+GUILDS_TAB = "guilds"
+GUILDS_HEADER = ["guild_id", "guild_name", "sheet_id", "service_account_email", "credentials_encrypted", "bound_by", "bound_at"]
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+_PURCHASE_COLUMNS = [
+    "id", "status", "agent_discord_id", "agent_display_name", "creation_source",
+    "requester_discord_id", "requester_display_name", "requester_line_id",
+    "item_description", "image_url_1", "image_url_2", "image_url_3",
+    "store_location", "auto_approve_limit_jpy", "confirm_required_above_jpy",
+    "spec_conditions", "item_nature", "notes", "acknowledged_risk",
+    "created_by_discord_id", "created_at", "updated_at",
+]
+# 新綁定的試算表會自動補上這些分頁與標題列
+SHEET_TEMPLATES = {
+    "expense":      ["id", "time", "debtor", "creditor", "amount", "rate", "item"],
+    "history":      ["id", "record_time", "clear_time", "debtor", "creditor", "amount", "rate", "item"],
+    "config":       ["key", "value"],
+    "members":      ["name", "discord_id"],
+    "triggers":     ["id", "keyword", "response_text", "image_url", "mention_name", "match_type", "reply_type", "probability"],
+    "reminders":    ["id", "content", "mention_name", "hour", "minute", "created_by", "created_by_name"],
+    "purchases":    _PURCHASE_COLUMNS,
+    "trips":        ["agent_discord_id", "agent_display_name", "itinerary_text", "started_at"],
+    "trip_history": _PURCHASE_COLUMNS + ["trip_itinerary_text", "trip_started_at", "archived_at"],
+}
+
+class BindError(Exception):
+    """綁定失敗；訊息會直接顯示給操作的管理員看。"""
+
+def _guild_fernet():
+    """用環境變數 GUILD_SECRET_KEY 加解密其他伺服器的金鑰；沒設定（或太短）時回傳 None，代表不開放綁定。"""
+    secret = os.getenv("GUILD_SECRET_KEY", "")
+    if len(secret) < 16:
+        return None
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest()))
+
+def _guilds_ws(create: bool = False):
+    spreadsheet = _home_state.spreadsheet()
+    try:
+        return spreadsheet.worksheet(GUILDS_TAB)
+    except gspread.WorksheetNotFound:
+        if not create:
+            return None
+        ws = spreadsheet.add_worksheet(title=GUILDS_TAB, rows=200, cols=len(GUILDS_HEADER))
+        ws.append_row(GUILDS_HEADER)
+        return ws
+
+def load_guild_bindings():
+    """把已綁定的伺服器從主試算表讀進記憶體（啟動時執行）。"""
+    global _bindings_loaded
+    ws = _guilds_ws()
+    rows = ws.get_all_values()[1:] if ws is not None else []
+    fernet = _guild_fernet()
+    for row in rows:
+        if len(row) < 5 or not row[0].strip().isdigit():
+            continue
+        guild_id = int(row[0])
+        if fernet is None:
+            print(f"⚠️ 伺服器 {guild_id} 有綁定資料，但沒有設定 GUILD_SECRET_KEY，無法解密，先略過")
+            continue
+        try:
+            info = json.loads(fernet.decrypt(row[4].encode("ascii")).decode("utf-8"))
+        except (InvalidToken, ValueError):
+            print(f"⚠️ 伺服器 {guild_id} 的綁定資料解不開（GUILD_SECRET_KEY 換過了？），該伺服器需要重新綁定")
+            continue
+        _guild_states[guild_id] = GuildState(guild_id, row[2], credentials_info=info, service_account_email=row[3])
+    _bindings_loaded = True
+
+def save_guild_binding(guild_id: int, guild_name: str, sheet_id: str, info: dict, bound_by: int):
+    token = _guild_fernet().encrypt(json.dumps(info).encode("utf-8")).decode("ascii")
+    record = [
+        str(guild_id), guild_name, sheet_id, info["client_email"], token,
+        str(bound_by), get_taiwan_now().strftime(TIME_FORMAT),
+    ]
+    ws = _guilds_ws(create=True)
+    for i, row in enumerate(ws.get_all_values()):
+        if i > 0 and row and row[0] == str(guild_id):
+            ws.update(values=[record], range_name=f"A{i+1}:G{i+1}")
+            return
+    ws.append_row(record)
+
+def delete_guild_binding(guild_id: int) -> bool:
+    ws = _guilds_ws()
+    if ws is None:
+        return False
+    for i, row in enumerate(ws.get_all_values()):
+        if i > 0 and row and row[0] == str(guild_id):
+            ws.delete_rows(i + 1)
+            return True
+    return False
+
+def parse_sheet_id(text: str):
+    """從試算表網址或 ID 取出試算表 ID；看不懂時回傳 None。"""
+    text = text.strip()
+    match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", text)
+    if match:
+        return match.group(1)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{20,}", text) else None
+
+def parse_service_account_key(text: str):
+    """檢查貼上的服務帳號金鑰。回傳 (金鑰資料, None) 或 (None, 錯誤訊息)。
+    只留下登入需要的欄位，而且 token_uri 一律改成 Google 官方網址——
+    金鑰是別人貼進來的，不能讓機器人照著裡面寫的任意網址去連線。"""
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return None, "金鑰內容不是完整的 JSON，請把下載的 `.json` 檔整份內容貼上（從 `{` 到 `}`）。"
+    if not isinstance(raw, dict) or raw.get("type") != "service_account":
+        return None, "這不是服務帳號金鑰（`type` 必須是 `service_account`）。"
+    email, private_key = raw.get("client_email"), raw.get("private_key")
+    if not isinstance(email, str) or not email.endswith(".gserviceaccount.com"):
+        return None, "金鑰裡找不到服務帳號信箱（`client_email`）。"
+    if not isinstance(private_key, str) or "PRIVATE KEY" not in private_key:
+        return None, "金鑰裡找不到 `private_key`，可能沒有整份貼上。"
+    return {
+        "type": "service_account",
+        "project_id": str(raw.get("project_id", "")),
+        "private_key_id": str(raw.get("private_key_id", "")),
+        "private_key": private_key,
+        "client_email": email,
+        "client_id": str(raw.get("client_id", "")),
+        "token_uri": GOOGLE_TOKEN_URI,
+    }, None
+
+def ensure_worksheets(spreadsheet) -> list:
+    """補齊缺少的分頁與標題列，回傳新建的分頁名稱。已經有內容的分頁完全不會被更動。
+    整個過程只用少數幾次 API 呼叫（Sheets 呼叫是同步的，一次一次建會讓機器人卡住好幾秒）。"""
+    titles = list(SHEET_TEMPLATES)
+    existing = {ws.title for ws in spreadsheet.worksheets()}
+    missing = [title for title in titles if title not in existing]
+    if missing:
+        spreadsheet.batch_update({"requests": [
+            {"addSheet": {"properties": {
+                "title": title,
+                "gridProperties": {"rowCount": 1000, "columnCount": max(len(SHEET_TEMPLATES[title]), 10)},
+            }}}
+            for title in missing
+        ]})
+    # 標題列另外寫：A1 是空的分頁才寫，所以上次綁到一半失敗、重新綁定時也補得回來
+    first_cells = spreadsheet.values_batch_get([f"'{title}'!A1" for title in titles]).get("valueRanges", [])
+    blank = [title for title, cell in zip(titles, first_cells) if not cell.get("values")]
+    if blank:
+        spreadsheet.values_batch_update({
+            "valueInputOption": "RAW",
+            "data": [{"range": f"'{title}'!A1", "values": [SHEET_TEMPLATES[title]]} for title in blank],
+        })
+    return missing
+
+def bind_guild_sheet(guild_id: int, guild_name: str, sheet_id: str, info: dict, bound_by: int):
+    """驗證金鑰與試算表、補齊分頁、存下綁定資料。成功回傳 (狀態, 新建的分頁)；失敗丟 BindError。"""
+    email = info["client_email"]
+    taken = sheet_id == _home_state.sheet_id or any(
+        state.sheet_id == sheet_id for other_id, state in _guild_states.items() if other_id != guild_id
+    )
+    if taken:
+        raise BindError("這份試算表已經綁定在另一個伺服器上了，請另外建立一份新的試算表。")
+    share_hint = f"請把試算表共用給 `{email}`，權限選「編輯者」。"
+    state = GuildState(guild_id, sheet_id, credentials_info=info, service_account_email=email)
+    try:
+        spreadsheet = state.spreadsheet()
+    except gspread.SpreadsheetNotFound:
+        raise BindError("找不到這份試算表，請確認網址或 ID 有沒有貼對。") from None
+    except PermissionError as e:
+        reason = str(e.__cause__)
+        if "has not been used" in reason or "is disabled" in reason:
+            raise BindError("這個服務帳號所屬的專案還沒啟用 Google Sheets API。請到 Google Cloud Console 啟用，過幾分鐘再試一次。") from None
+        raise BindError("服務帳號沒有權限開啟這份試算表。" + share_hint) from None
+    except gspread.exceptions.APIError as e:
+        raise BindError(f"Google 拒絕了這個請求（狀態碼 {e.response.status_code}），請稍後再試。") from None
+    except Exception as e:
+        # 只記錯誤類型，不印內容，避免金鑰相關資訊進到 log
+        print(f"⚠️ 綁定驗證失敗（伺服器 {guild_id}）：{type(e).__name__}")
+        raise BindError("無法用這把金鑰登入 Google。金鑰可能沒有整份貼上，或已經在 Google Cloud Console 被刪除。") from None
+    try:
+        created = ensure_worksheets(spreadsheet)
+    except gspread.exceptions.APIError:
+        raise BindError("服務帳號打得開試算表，但沒有編輯權限。" + share_hint) from None
+    save_guild_binding(guild_id, guild_name, sheet_id, info, bound_by)
+    _guild_states[guild_id] = state
+    return state, created
+
+def unbind_guild_sheet(guild_id: int) -> bool:
+    """解除綁定：刪掉存著的金鑰與設定。對方試算表裡的資料不會被動到。"""
+    removed = delete_guild_binding(guild_id)
+    return _guild_states.pop(guild_id, None) is not None or removed
+
 # ==================== 設定檔讀寫（Google Sheets）====================
 def load_config():
-    global _config_cache
-    if _config_cache is not None:
-        return _config_cache
+    if _st().config_cache is not None:
+        return _st().config_cache
     try:
         ws = get_config_ws()
         rows = ws.get_all_values()
@@ -116,13 +457,12 @@ def load_config():
                     config[key] = int(value)
                 except ValueError:
                     config[key] = value
-        _config_cache = config
-        return _config_cache
+        _st().config_cache = config
+        return _st().config_cache
     except Exception:
         return {"cashier_channel_id": 0, "recovery_channel_id": 0, "sheet_id": ""}
 
 def save_config(key, value):
-    global _config_cache
     ws = get_config_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -130,16 +470,15 @@ def save_config(key, value):
             continue
         if row and row[0] == key:
             ws.update(f"B{i+1}", [[str(value)]])
-            _config_cache = None  # 清除快取
+            _st().config_cache = None  # 清除快取
             return
     ws.append_row([key, str(value)])
-    _config_cache = None  # 清除快取
+    _st().config_cache = None  # 清除快取
 
 # ==================== 成員資料讀寫（Google Sheets）====================
 def load_members_data():
-    global _members_cache
-    if _members_cache is not None:
-        return _members_cache
+    if _st().members_cache is not None:
+        return _st().members_cache
     try:
         ws = get_members_ws()
         rows = ws.get_all_values()
@@ -150,19 +489,17 @@ def load_members_data():
                 members.append(row[0])
                 if len(row) >= 2 and row[1]:
                     discord_map[row[1]] = row[0]
-        _members_cache = {"members": members, "discord_map": discord_map}
-        return _members_cache
+        _st().members_cache = {"members": members, "discord_map": discord_map}
+        return _st().members_cache
     except Exception:
         return {"members": [], "discord_map": {}}
 
 def add_member_to_sheet(name):
-    global _members_cache
     ws = get_members_ws()
     ws.append_row([name, ""])
-    _members_cache = None  # 清除快取
+    _st().members_cache = None  # 清除快取
 
 def remove_member_from_sheet(name):
-    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -170,11 +507,10 @@ def remove_member_from_sheet(name):
             continue
         if row and row[0] == name:
             ws.delete_rows(i + 1)
-            return
-    _members_cache = None  # 清除快取
+            break
+    _st().members_cache = None  # 清除快取
 
 def set_discord_mapping(name, discord_id):
-    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -182,12 +518,11 @@ def set_discord_mapping(name, discord_id):
             continue
         if row and row[0] == name:
             ws.update(f"B{i+1}", [[discord_id]])
-            return
-    _members_cache = None  # 清除快取
+            break
+    _st().members_cache = None  # 清除快取
 
 def rename_member_in_sheets(old_name, new_name):
     # 更新 members 工作表
-    global _members_cache
     ws = get_members_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -195,8 +530,8 @@ def rename_member_in_sheets(old_name, new_name):
             continue
         if row and row[0] == old_name:
             ws.update(f"A{i+1}", [[new_name]])
-            _members_cache = None  # 清除快取
-    _members_cache = None  # 清除快取
+            _st().members_cache = None  # 清除快取
+    _st().members_cache = None  # 清除快取
 
     # 更新 expense 和 history 工作表
     expense_ws, history_ws = get_worksheets()
@@ -214,9 +549,8 @@ def get_members():
 
 # ==================== 觸發詞資料讀寫（Google Sheets）====================
 def load_triggers():
-    global _triggers_cache
-    if _triggers_cache is not None:
-        return _triggers_cache
+    if _st().triggers_cache is not None:
+        return _st().triggers_cache
     try:
         ws = get_triggers_ws()
         rows = ws.get_all_values()
@@ -233,8 +567,8 @@ def load_triggers():
                     "reply_type":    row[6] if len(row) > 6 and row[6] else "new",
                     "probability":   int(row[7]) if len(row) > 7 and row[7].isdigit() else 100,
                 })
-        _triggers_cache = triggers
-        return _triggers_cache
+        _st().triggers_cache = triggers
+        return _st().triggers_cache
     except Exception:
         return []
 
@@ -245,15 +579,13 @@ def get_trigger_next_id():
     return max(ids) + 1 if ids else 1
 
 def add_trigger(keyword, response_text, image_url, mention_name, match_type="contains", reply_type="new", probability=100):
-    global _triggers_cache
     ws = get_triggers_ws()
     next_id = get_trigger_next_id()
     ws.append_row([next_id, keyword, response_text, image_url, mention_name, match_type, reply_type, probability])
-    _triggers_cache = None
+    _st().triggers_cache = None
     return next_id
 
 def delete_trigger_by_id(trigger_id):
-    global _triggers_cache
     ws = get_triggers_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -261,7 +593,7 @@ def delete_trigger_by_id(trigger_id):
             continue
         if row and row[0] == str(trigger_id):
             ws.delete_rows(i + 1)
-            _triggers_cache = None
+            _st().triggers_cache = None
             return True
     return False
 
@@ -309,7 +641,6 @@ def delete_reminder_by_id(reminder_id):
     return False
 
 def update_trigger_by_id(trigger_id, keyword, response_text, image_url, mention_name, match_type, reply_type, probability):
-    global _triggers_cache
     ws = get_triggers_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -317,15 +648,48 @@ def update_trigger_by_id(trigger_id, keyword, response_text, image_url, mention_
             continue
         if row and row[0] == str(trigger_id):
             ws.update(f"A{i+1}:H{i+1}", [[row[0], keyword, response_text, image_url, mention_name, match_type, reply_type, probability]])
-            _triggers_cache = None
+            _st().triggers_cache = None
             return True
     return False
 
+# ==================== 觸發詞關鍵詞檢查 ====================
+MAX_TRIGGER_REGEX_LENGTH = 200
+# 巢狀量詞（例如 (a+)+、(.*)*）碰到特定訊息時比對時間會爆炸，整個機器人會卡死。
+# 這是盡力而為的檢查，擋得住最常見的寫法，不保證擋下所有危險的正則。
+_QUANTIFIER = r"(?:[+*]|\{\d*,\d*\})"
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*" + _QUANTIFIER + r"[^()]*\)\s*" + _QUANTIFIER)
+_trigger_regex_cache = {}
+
+def check_trigger_regex(pattern: str):
+    """正則可以使用時回傳 None，否則回傳不能用的原因。"""
+    if len(pattern) > MAX_TRIGGER_REGEX_LENGTH:
+        return f"正則太長了（上限 {MAX_TRIGGER_REGEX_LENGTH} 字）"
+    if _NESTED_QUANTIFIER_RE.search(pattern):
+        return "正則裡有巢狀量詞（例如 (a+)+ ），碰到特定訊息會卡死機器人，請改寫"
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        return f"正則語法錯誤：{e}"
+    return None
+
+def check_trigger_keyword(keyword: str, match_type: str):
+    """關鍵詞可以使用時回傳 None，否則回傳不能用的原因。"""
+    if not keyword.strip():
+        return "觸發關鍵詞不能是空白（會變成每一則訊息都觸發）"
+    if match_type == "regex":
+        return check_trigger_regex(keyword)
+    return None
+
+def compile_trigger_regex(pattern: str):
+    """回傳編譯好的正則；沒通過檢查的回傳 None（該觸發詞不會觸發）。"""
+    if pattern not in _trigger_regex_cache:
+        _trigger_regex_cache[pattern] = None if check_trigger_regex(pattern) else re.compile(pattern, re.IGNORECASE)
+    return _trigger_regex_cache[pattern]
+
 # ==================== 代購資料讀寫（Google Sheets）====================
 def load_purchases():
-    global _purchases_cache
-    if _purchases_cache is not None:
-        return _purchases_cache
+    if _st().purchases_cache is not None:
+        return _st().purchases_cache
     try:
         ws = get_purchases_ws()
         rows = ws.get_all_values()
@@ -356,8 +720,8 @@ def load_purchases():
                     "created_at":                  row[20] if len(row) > 20 else "",
                     "updated_at":                  row[21] if len(row) > 21 else "",
                 })
-        _purchases_cache = purchases
-        return _purchases_cache
+        _st().purchases_cache = purchases
+        return _st().purchases_cache
     except Exception:
         return []
 
@@ -372,7 +736,6 @@ def add_purchase(agent_discord_id, agent_display_name, creation_source,
                   item_description, image_url_1, image_url_2, image_url_3,
                   store_location, auto_approve_limit_jpy, confirm_required_above_jpy,
                   spec_conditions, item_nature, notes, created_by_discord_id):
-    global _purchases_cache
     ws = get_purchases_ws()
     next_id = get_purchase_next_id()
     now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -384,11 +747,10 @@ def add_purchase(agent_discord_id, agent_display_name, creation_source,
         spec_conditions, item_nature, notes, "TRUE", created_by_discord_id,
         now, now,
     ])
-    _purchases_cache = None
+    _st().purchases_cache = None
     return next_id
 
 def update_purchase_status_by_id(purchase_id, new_status):
-    global _purchases_cache
     ws = get_purchases_ws()
     rows = ws.get_all_values()
     now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -398,14 +760,13 @@ def update_purchase_status_by_id(purchase_id, new_status):
         if row and row[0] == str(purchase_id):
             ws.update(f"B{i+1}", [[new_status]])
             ws.update(f"V{i+1}", [[now]])
-            _purchases_cache = None
+            _st().purchases_cache = None
             return True
     return False
 
 def update_purchase_details_by_id(purchase_id, requester_line_id, item_description, store_location,
                                     auto_approve_limit_jpy, confirm_required_above_jpy,
                                     spec_conditions, item_nature, notes):
-    global _purchases_cache
     ws = get_purchases_ws()
     rows = ws.get_all_values()
     now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -417,12 +778,11 @@ def update_purchase_details_by_id(purchase_id, requester_line_id, item_descripti
             ws.update(f"M{i+1}:O{i+1}", [[store_location, auto_approve_limit_jpy, confirm_required_above_jpy]])
             ws.update(f"P{i+1}:R{i+1}", [[spec_conditions, item_nature, notes]])
             ws.update(f"V{i+1}", [[now]])
-            _purchases_cache = None
+            _st().purchases_cache = None
             return True
     return False
 
 def delete_purchase_by_id(purchase_id):
-    global _purchases_cache
     ws = get_purchases_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -430,25 +790,23 @@ def delete_purchase_by_id(purchase_id):
             continue
         if row and row[0] == str(purchase_id):
             ws.delete_rows(i + 1)
-            _purchases_cache = None
+            _st().purchases_cache = None
             return True
     return False
 
 def delete_all_purchases_for_agent(agent_discord_id):
-    global _purchases_cache
     ws = get_purchases_ws()
     rows = ws.get_all_values()
     row_numbers = [i + 1 for i, row in enumerate(rows) if i > 0 and row and len(row) > 2 and row[2] == str(agent_discord_id)]
     for row_number in reversed(row_numbers):
         ws.delete_rows(row_number)
-    _purchases_cache = None
+    _st().purchases_cache = None
     return len(row_numbers)
 
 # ==================== 代購行程資料讀寫（Google Sheets）====================
 def load_trips():
-    global _trips_cache
-    if _trips_cache is not None:
-        return _trips_cache
+    if _st().trips_cache is not None:
+        return _st().trips_cache
     try:
         ws = get_trips_ws()
         rows = ws.get_all_values()
@@ -461,8 +819,8 @@ def load_trips():
                     "itinerary_text":     row[2] if len(row) > 2 else "",
                     "started_at":         row[3] if len(row) > 3 else "",
                 })
-        _trips_cache = trips
-        return _trips_cache
+        _st().trips_cache = trips
+        return _st().trips_cache
     except Exception:
         return []
 
@@ -470,7 +828,6 @@ def get_trip_for_agent(agent_discord_id):
     return next((t for t in load_trips() if t["agent_discord_id"] == str(agent_discord_id)), None)
 
 def set_trip(agent_discord_id, agent_display_name, itinerary_text):
-    global _trips_cache
     ws = get_trips_ws()
     rows = ws.get_all_values()
     now = get_taiwan_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -479,13 +836,12 @@ def set_trip(agent_discord_id, agent_display_name, itinerary_text):
             continue
         if row and row[0] == str(agent_discord_id):
             ws.update(f"A{i+1}:D{i+1}", [[str(agent_discord_id), agent_display_name, itinerary_text, now]])
-            _trips_cache = None
+            _st().trips_cache = None
             return
     ws.append_row([str(agent_discord_id), agent_display_name, itinerary_text, now])
-    _trips_cache = None
+    _st().trips_cache = None
 
 def clear_trip(agent_discord_id):
-    global _trips_cache
     ws = get_trips_ws()
     rows = ws.get_all_values()
     for i, row in enumerate(rows):
@@ -493,7 +849,7 @@ def clear_trip(agent_discord_id):
             continue
         if row and row[0] == str(agent_discord_id):
             ws.delete_rows(i + 1)
-            _trips_cache = None
+            _st().trips_cache = None
             return True
     return False
 
@@ -518,12 +874,98 @@ def archive_purchases_to_history(purchases, trip):
     ]
     ws.append_rows(rows)
 
+# ==================== 伺服器脈絡：每個互動只碰自己伺服器的資料 ====================
+SETUP_COMMAND = "管理者工具"
+NOT_BOUND_MESSAGE = "🧭 這個伺服器還沒綁定自己的 Google 試算表。請伺服器管理員執行 `/管理者工具`，照著引導完成設定。"
+STARTING_MESSAGE = "⏳ 機器人剛啟動，還在讀取設定，請過幾秒再試一次。"
+
+async def is_home_member(user_id: int) -> bool:
+    """私訊下指令時用：確認對方是主伺服器的成員。"""
+    guild = bot.get_guild(_home_state.guild_id) if _home_state.guild_id else None
+    if guild is None:
+        return False
+    if guild.get_member(user_id):
+        return True
+    try:
+        await guild.fetch_member(user_id)
+        return True
+    except discord.HTTPException:
+        return False
+
+async def bind_guild_context(interaction: discord.Interaction, required: bool = True) -> bool:
+    """把「這個互動屬於哪個伺服器」記到目前的執行脈絡，之後所有資料讀寫都只會碰那個伺服器的試算表。
+    required=True 時，還沒綁定試算表的伺服器會被擋下來，並看到該怎麼設定的提示。"""
+    if interaction.guild_id is not None:
+        state = state_for_guild(interaction.guild_id)
+    elif await is_home_member(interaction.user.id):
+        state = _home_state     # 私訊：只有主伺服器的成員能用，用的是主伺服器的資料
+    else:
+        state = None
+    _guild_ctx.set(state)
+    if state is not None or not required:
+        return True
+    if interaction.type is not discord.InteractionType.autocomplete:
+        if not _startup_done:
+            message = STARTING_MESSAGE
+        elif interaction.guild_id is None:
+            message = "❌ 請在伺服器裡使用這個指令。"
+        else:
+            message = NOT_BOUND_MESSAGE
+        try:
+            await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+    return False
+
+class GuildBoundTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # 只有 /管理者工具 可以在還沒綁定的伺服器使用（它是綁定流程的入口）
+        name = (interaction.data or {}).get("name")
+        return await bind_guild_context(interaction, required=(name != SETUP_COMMAND))
+
+class GuildView(discord.ui.View):
+    """所有選單的共同基底：按鈕／下拉選單被操作時，先確定是哪個伺服器。"""
+    requires_binding = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await bind_guild_context(interaction, required=self.requires_binding)
+
+class GuildModal(discord.ui.Modal):
+    """所有表單的共同基底，作用同 GuildView。"""
+    requires_binding = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await bind_guild_context(interaction, required=self.requires_binding)
+
+def user_is_admin(interaction: discord.Interaction) -> bool:
+    """是否為伺服器管理員。私訊裡沒有伺服器權限，一律視為不是。"""
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+def get_guild_channel(channel_id):
+    """取得「目前這個伺服器」的頻道；頻道屬於別的伺服器就當作找不到，
+    所以帳務資料不會被送到（或清掉）別的伺服器的頻道。"""
+    state = _st()
+    channel = bot.get_channel(channel_id) if isinstance(channel_id, int) and channel_id else None
+    guild = getattr(channel, "guild", None)
+    if channel is None or guild is None or guild.id != state.guild_id:
+        return None
+    return channel
+
+def default_notify_channel_id() -> int:
+    """播報頻道的預設值：只有主伺服器有寫死的預設頻道，其他伺服器要自己設定。"""
+    return NOTIFY_CHANNEL_ID if _st().is_home else 0
+
+def default_treat_role_id() -> int:
+    """請客時要 tag 的身分組預設值：只有主伺服器有寫死的預設值。"""
+    return ROLE_ID if _st().is_home else 0
+
 # ==================== Bot 設定 ====================
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=GuildBoundTree)
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -536,6 +978,11 @@ async def upload_to_imgbb(attachment: discord.Attachment) -> str:
     """下載 Discord 附件並上傳至 imgbb，回傳永久直連 URL。失敗時拋出例外。"""
     if not IMGBB_API_KEY:
         raise ValueError("尚未設定 IMGBB_API_KEY 環境變數")
+    # 整個檔案會先讀進記憶體再轉 base64，所以先擋掉非圖片與過大的檔案
+    if attachment.content_type and not attachment.content_type.startswith("image/"):
+        raise ValueError("只接受圖片檔")
+    if attachment.size > MAX_IMAGE_BYTES:
+        raise ValueError(f"圖片超過 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 上限")
     import aiohttp
     async with aiohttp.ClientSession() as session:
         async with session.get(attachment.url) as resp:
@@ -559,7 +1006,8 @@ def get_next_id(expense_ws):
 def save_record(debtor, creditor, amount, rate, item):
     expense_ws, _ = get_worksheets()
     next_id = get_next_id(expense_ws)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 試算表裡一律存台灣時間（明確換算，不受執行機器的時區影響）
+    now = get_taiwan_now().strftime(TIME_FORMAT)
     expense_ws.append_row([next_id, now, debtor, creditor, amount, rate, item])
     return next_id
 
@@ -591,6 +1039,29 @@ def delete_record_by_id(record_id):
             return True
     return False
 
+def delete_expense_rows_by_ids(record_ids) -> int:
+    """刪掉 expense 表裡指定編號的列，回傳刪除的列數。
+    所有刪除包在同一個 API 呼叫裡（全有或全無），其他列完全不會被碰到。"""
+    ids = {int(i) for i in record_ids}
+    expense_ws, _ = get_worksheets()
+    rows = expense_ws.get_all_values()
+    row_numbers = [
+        i + 1 for i, row in enumerate(rows)
+        if i > 0 and row and row[0].strip().isdigit() and int(row[0]) in ids
+    ]
+    if not row_numbers:
+        return 0
+    sheet_id = expense_ws.id
+    # 先在表尾補上同樣數量的空白列，表格大小才不會越刪越小（Sheets 不允許把資料列刪到一列不剩）
+    requests = [{"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS", "length": len(row_numbers)}}]
+    # 由下往上刪，前面的列號才不會因為刪除而位移
+    for n in sorted(row_numbers, reverse=True):
+        requests.append({"deleteDimension": {"range": {
+            "sheetId": sheet_id, "dimension": "ROWS", "startIndex": n - 1, "endIndex": n,
+        }}})
+    get_spreadsheet().batch_update({"requests": requests})
+    return len(row_numbers)
+
 def update_record_by_id(record_id, debtor, creditor, amount, rate, item):
     expense_ws, _ = get_worksheets()
     rows = expense_ws.get_all_values()
@@ -613,11 +1084,22 @@ def get_taiwan_now():
     return datetime.now(pytz.utc).astimezone(TAIPEI_TZ)
 
 def taiwan_datetime_of(time_str: str):
-    naive = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-    return pytz.utc.localize(naive).astimezone(TAIPEI_TZ)
+    """試算表裡的時間字串本身就是台灣時間（舊的 UTC 資料由 ensure_time_storage 一次轉換完畢）。"""
+    return TAIPEI_TZ.localize(datetime.strptime(time_str.strip(), TIME_FORMAT))
 
-def taiwan_year_of(time_str: str) -> int:
-    return taiwan_datetime_of(time_str).year
+def taiwan_year_of(time_str: str):
+    """回傳年份；時間格式看不懂（例如被手動改過）時回傳 None，該筆不會被算進任何年度。"""
+    try:
+        return taiwan_datetime_of(time_str).year
+    except ValueError:
+        return None
+
+def format_clear_date(clear_time: str) -> str:
+    """把 history 的結清時間（台灣時間）顯示成 yymmdd。"""
+    try:
+        return taiwan_datetime_of(clear_time).strftime("%y%m%d")
+    except ValueError:
+        return clear_time.replace("-", "").replace(" ", "")[2:8]
 
 def load_history_records():
     _, history_ws = get_worksheets()
@@ -718,7 +1200,7 @@ def format_rate(rate):
 # ==================== 餐盤回收區排版繪製邏輯 ====================
 async def update_recovery_board():
     config = load_config()
-    channel = bot.get_channel(config.get("recovery_channel_id", 0))
+    channel = get_guild_channel(config.get("recovery_channel_id", 0))
     if not channel:
         print(f"❌ 找不到餐盤回收區頻道")
         return
@@ -732,7 +1214,7 @@ async def update_recovery_board():
             except: pass
 
     try:
-        history_ws = get_spreadsheet().worksheet("history")
+        _, history_ws = get_worksheets()
         rows = history_ws.get_all_values()
         records = []
         for row in rows[1:]:
@@ -771,7 +1253,7 @@ async def update_recovery_board():
         for r in group_records:
             ntd = math.ceil(r['amount'] * r['rate'])
             ntd_str = str(ntd)
-            clear_date = r['clear_time'].replace("-", "").replace(" ", "")[2:8]
+            clear_date = format_clear_date(r['clear_time'])
 
             c_id       = align_text(f"{r['id']:03d}", 6, 'center')
             c_debtor   = align_text(r['debtor'],      6, 'center')
@@ -799,7 +1281,7 @@ async def update_recovery_board():
 # ==================== 收銀台排版繪製邏輯 ====================
 async def update_cashier_board():
     config = load_config()
-    channel = bot.get_channel(config.get("cashier_channel_id", 0))
+    channel = get_guild_channel(config.get("cashier_channel_id", 0))
     if not channel:
         print(f"❌ 找不到收銀台頻道，請用 /設定頻道 設定")
         return
@@ -938,7 +1420,7 @@ def build_members_display():
         lines.append("（尚無成員）")
     return "\n".join(lines)
 
-class MembersManageView(discord.ui.View):
+class MembersManageView(GuildView):
     def __init__(self, is_admin: bool):
         super().__init__(timeout=120)
         self.is_admin = is_admin
@@ -977,7 +1459,7 @@ class MembersManageView(discord.ui.View):
         await interaction.response.send_message("請選擇要移除的成員：", view=RemoveSelectView(members), ephemeral=True)
 
 # ==================== 設定對應 ====================
-class MappingSelectView(discord.ui.View):
+class MappingSelectView(GuildView):
     def __init__(self, members):
         super().__init__(timeout=60)
         select = discord.ui.Select(
@@ -990,7 +1472,7 @@ class MappingSelectView(discord.ui.View):
     async def select_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(SetMappingModal(interaction.data["values"][0]))
 
-class SetMappingModal(discord.ui.Modal, title="設定 Discord 對應"):
+class SetMappingModal(GuildModal, title="設定 Discord 對應"):
     def __init__(self, name):
         super().__init__()
         self.name = name
@@ -1010,7 +1492,7 @@ class SetMappingModal(discord.ui.Modal, title="設定 Discord 對應"):
         await interaction.followup.send(f"✅ 已設定 {self.name} 對應到 <@{discord_id}>", ephemeral=True)
 
 # ==================== 改名 ====================
-class RenameSelectView(discord.ui.View):
+class RenameSelectView(GuildView):
     def __init__(self, members):
         super().__init__(timeout=60)
         select = discord.ui.Select(
@@ -1023,7 +1505,7 @@ class RenameSelectView(discord.ui.View):
     async def select_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(RenameModal(interaction.data["values"][0]))
 
-class RenameModal(discord.ui.Modal, title="改名"):
+class RenameModal(GuildModal, title="改名"):
     def __init__(self, old_name):
         super().__init__()
         self.old_name = old_name
@@ -1048,7 +1530,7 @@ class RenameModal(discord.ui.Modal, title="改名"):
         await update_cashier_board()
 
 # ==================== 新增成員 ====================
-class AddMemberModal(discord.ui.Modal, title="新增成員"):
+class AddMemberModal(GuildModal, title="新增成員"):
     def __init__(self):
         super().__init__()
         self.name_input = discord.ui.TextInput(label="新成員名字", placeholder="輸入名字")
@@ -1068,7 +1550,7 @@ class AddMemberModal(discord.ui.Modal, title="新增成員"):
         await interaction.followup.send(f"✅ 已新增成員「{new_name}」", ephemeral=True)
 
 # ==================== 移除成員 ====================
-class RemoveSelectView(discord.ui.View):
+class RemoveSelectView(GuildView):
     def __init__(self, members):
         super().__init__(timeout=60)
         select = discord.ui.Select(
@@ -1088,7 +1570,7 @@ class RemoveSelectView(discord.ui.View):
             f"⚠️ 確定要移除成員「{name}」嗎？此操作無法復原。",
             view=ConfirmRemoveView(name), ephemeral=True)
 
-class ConfirmRemoveView(discord.ui.View):
+class ConfirmRemoveView(GuildView):
     def __init__(self, name):
         super().__init__(timeout=30)
         self.name = name
@@ -1129,7 +1611,7 @@ def build_split_summary(state, hint=""):
     return "\n".join(lines)
 
 # ==================== 分帳流程 ====================
-class SplitPayerView(discord.ui.View):
+class SplitPayerView(GuildView):
     def __init__(self):
         super().__init__(timeout=60)
         self.payer = None
@@ -1153,7 +1635,7 @@ class SplitPayerView(discord.ui.View):
             return
         await interaction.response.send_modal(SplitAmountModal(self.payer))
 
-class SplitAmountModal(discord.ui.Modal, title="填寫分帳資訊"):
+class SplitAmountModal(GuildModal, title="填寫分帳資訊"):
     def __init__(self, payer):
         super().__init__()
         self.payer = payer
@@ -1177,7 +1659,7 @@ class SplitAmountModal(discord.ui.Modal, title="填寫分帳資訊"):
         except ValueError:
             await interaction.response.send_message("❌ 金額必須是數字", ephemeral=True)
 
-class SplitPersonView(discord.ui.View):
+class SplitPersonView(GuildView):
     def __init__(self, state: SplitState):
         super().__init__(timeout=300)
         self.state           = state
@@ -1213,7 +1695,7 @@ class SplitPersonView(discord.ui.View):
             return
         await finalize_split(interaction, self.state)
 
-class SplitRatioModal(discord.ui.Modal, title="填寫分帳比例"):
+class SplitRatioModal(GuildModal, title="填寫分帳比例"):
     def __init__(self, state: SplitState, person: str):
         super().__init__()
         self.state  = state
@@ -1250,7 +1732,7 @@ async def finalize_split(interaction: discord.Interaction, state: SplitState):
     await update_cashier_board()
 
 # ==================== 兩段式記帳流程 ====================
-class RecordModal(discord.ui.Modal, title="新增記帳資料"):
+class RecordModal(GuildModal, title="新增記帳資料"):
     def __init__(self, debtor: str, creditor: str):
         super().__init__()
         self.debtor   = debtor
@@ -1273,7 +1755,7 @@ class RecordModal(discord.ui.Modal, title="新增記帳資料"):
         except ValueError:
             await interaction.followup.send("❌ 金額與匯率必須是數字", ephemeral=True)
 
-class NameSelectView(discord.ui.View):
+class NameSelectView(GuildView):
     def __init__(self):
         super().__init__(timeout=60)
         self.debtor   = None
@@ -1314,7 +1796,7 @@ class NameSelectView(discord.ui.View):
         await interaction.response.send_modal(RecordModal(self.debtor, self.creditor))
 
 # ==================== 修改用 Modal ====================
-class ModifyModal(discord.ui.Modal):
+class ModifyModal(GuildModal):
     def __init__(self, record_id, old_data):
         super().__init__(title=f"修改帳目 - 編號 {record_id:03d}")
         self.record_id = record_id
@@ -1347,8 +1829,18 @@ class ModifyModal(discord.ui.Modal):
         except ValueError:
             await interaction.followup.send("❌ 金額與匯率必須是數字", ephemeral=True)
 
+class ModifyLauncherView(GuildView):
+    def __init__(self, record_id, old_data):
+        super().__init__(timeout=120)
+        self.record_id = record_id
+        self.old_data = old_data
+
+    @discord.ui.button(label="開啟修改表單 →", style=discord.ButtonStyle.primary)
+    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ModifyModal(self.record_id, self.old_data))
+
 # ==================== 查帳 View ====================
-class AccountSelectView(discord.ui.View):
+class AccountSelectView(GuildView):
     def __init__(self):
         super().__init__(timeout=60)
         members = get_members()
@@ -1367,28 +1859,40 @@ class AccountSelectView(discord.ui.View):
         await interaction.channel.send(summary)
 
 # ==================== 設定頻道 Modal ====================
-class SetChannelsModal(discord.ui.Modal, title="設定頻道 ID"):
+class SetChannelsModal(GuildModal, title="設定頻道 ID"):
     def __init__(self):
         super().__init__()
         config = load_config()
+
+        def current(key, fallback=0) -> str:
+            value = config.get(key, fallback)
+            return str(value) if value else ""
+
         self.cashier_input = discord.ui.TextInput(
             label="收銀台頻道 ID",
             placeholder="右鍵點擊頻道 → 複製頻道 ID",
-            default=str(config.get("cashier_channel_id", "")) if config.get("cashier_channel_id") else ""
+            default=current("cashier_channel_id")
         )
         self.recovery_input = discord.ui.TextInput(
             label="餐盤回收區頻道 ID",
             placeholder="右鍵點擊頻道 → 複製頻道 ID",
-            default=str(config.get("recovery_channel_id", "")) if config.get("recovery_channel_id") else ""
+            default=current("recovery_channel_id")
         )
         self.notify_input = discord.ui.TextInput(
             label="每日播報／提醒頻道 ID",
             placeholder="右鍵點擊頻道 → 複製頻道 ID",
-            default=str(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
+            default=current("notify_channel_id", default_notify_channel_id())
+        )
+        self.role_input = discord.ui.TextInput(
+            label="有人請客時要 tag 的身分組 ID（選填）",
+            placeholder="伺服器設定 → 身分組 → 右鍵複製身分組 ID；留空＝不 tag",
+            default=current("treat_role_id", default_treat_role_id()),
+            required=False
         )
         self.add_item(self.cashier_input)
         self.add_item(self.recovery_input)
         self.add_item(self.notify_input)
+        self.add_item(self.role_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1396,28 +1900,27 @@ class SetChannelsModal(discord.ui.Modal, title="設定頻道 ID"):
             cashier_id  = int(self.cashier_input.value.strip())
             recovery_id = int(self.recovery_input.value.strip())
             notify_id   = int(self.notify_input.value.strip())
-            save_config("cashier_channel_id", cashier_id)
-            save_config("recovery_channel_id", recovery_id)
-            save_config("notify_channel_id", notify_id)
-            await interaction.followup.send("✅ 頻道設定完成！", ephemeral=True)
+            role_id     = int(self.role_input.value.strip() or "0")
         except ValueError:
-            await interaction.followup.send("❌ 頻道 ID 必須是純數字", ephemeral=True)
-
-# ==================== 設定試算表 Modal ====================
-class SetSheetModal(discord.ui.Modal, title="設定 Google Sheet ID"):
-    def __init__(self):
-        super().__init__()
-        self.sheet_input = discord.ui.TextInput(
-            label="Google Sheet ID",
-            placeholder="試算表網址中間那串字"
-        )
-        self.add_item(self.sheet_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        sheet_id = self.sheet_input.value.strip()
-        save_config("sheet_id", sheet_id)
-        await interaction.followup.send("✅ 試算表 ID 設定完成！", ephemeral=True)
+            await interaction.followup.send("❌ 頻道 ID 與身分組 ID 必須是純數字", ephemeral=True)
+            return
+        # 收銀台／餐盤回收區每次更新都會先清空頻道內的訊息，所以只接受「這個伺服器裡、機器人看得到」的頻道
+        for label, channel_id in (("收銀台", cashier_id), ("餐盤回收區", recovery_id), ("每日播報／提醒", notify_id)):
+            channel = bot.get_channel(channel_id)
+            if channel is None or getattr(channel, "guild", None) is None or channel.guild.id != interaction.guild_id:
+                await interaction.followup.send(
+                    f"❌ 找不到「{label}」頻道（ID：{channel_id}），請確認它是這個伺服器裡、機器人看得到的頻道",
+                    ephemeral=True,
+                )
+                return
+        if role_id and (interaction.guild is None or interaction.guild.get_role(role_id) is None):
+            await interaction.followup.send(f"❌ 這個伺服器裡找不到身分組（ID：{role_id}）", ephemeral=True)
+            return
+        save_config("cashier_channel_id", cashier_id)
+        save_config("recovery_channel_id", recovery_id)
+        save_config("notify_channel_id", notify_id)
+        save_config("treat_role_id", role_id)
+        await interaction.followup.send("✅ 頻道設定完成！", ephemeral=True)
 
 # ==================== 斜線指令系統 ====================
 async def member_autocomplete(interaction: discord.Interaction, current: str):
@@ -1456,7 +1959,158 @@ async def slash_split(interaction: discord.Interaction):
         return
     await interaction.response.send_message("💸 **分帳 — 步驟一：選擇付錢的人**", view=SplitPayerView(), ephemeral=True)
 
-class AdminToolsView(discord.ui.View):
+# ==================== 設定試算表（其他伺服器綁定自己的試算表）====================
+SETUP_GUIDE = (
+    "🧭 **這個伺服器還沒綁定試算表**\n"
+    "這個機器人把每個伺服器的資料存在「那個伺服器自己的」Google 試算表裡，所以要先做一次設定（大約 10 分鐘）：\n\n"
+    "**① 建立試算表**\n"
+    "到 Google 試算表開一份空白的試算表。需要的分頁機器人之後會自動建立。\n\n"
+    "**② 建立服務帳號**（機器人用它讀寫你的試算表，用的是你自己的 Google API 額度）\n"
+    "　1. 到 <https://console.cloud.google.com> 建立一個專案\n"
+    "　2. 「API 和服務 → 程式庫」搜尋並啟用 **Google Sheets API**\n"
+    "　3. 「IAM 與管理 → 服務帳戶」建立服務帳戶（不需要給任何角色）\n"
+    "　4. 點進該服務帳戶 →「金鑰」→ 新增金鑰 → **JSON**，會下載一個 `.json` 檔\n\n"
+    "**③ 共用試算表**\n"
+    "用記事本打開 `.json` 檔，找到 `client_email` 那一行的信箱，把試算表**共用給這個信箱，權限選「編輯者」**。\n\n"
+    "**④ 綁定**\n"
+    "按下方按鈕，貼上試算表網址，以及 `.json` 檔的**整份內容**。\n\n"
+    "🔐 **請先知道**：這把金鑰會交給機器人保管（加密後儲存），機器人的擁有者技術上能透過它讀寫這份試算表。"
+    "請使用**專門為這個機器人新建的服務帳號**，而且**只把這一份試算表共用給它**。"
+    "之後隨時可以回來解除綁定，再到 Google Cloud Console 把金鑰刪掉。"
+)
+
+def binding_blocker(interaction: discord.Interaction, need_secret: bool = True):
+    """綁定／解除綁定前的共同檢查。可以進行時回傳 None，否則回傳要顯示給使用者的訊息。"""
+    if interaction.guild_id is None:
+        return "❌ 請在伺服器裡使用。"
+    if not user_is_admin(interaction):
+        return "❌ 只有伺服器管理員才能設定試算表"
+    if not _startup_done or not _bindings_loaded:
+        # 其他伺服器的綁定資料還沒讀進來時不能綁定，否則檢查不出「這份試算表是不是已經被別人綁走」
+        return STARTING_MESSAGE
+    if _home_state.guild_id is None:
+        return "🔒 機器人擁有者還沒完成設定（尚未指定 `HOME_GUILD_ID`），暫時無法綁定。"
+    if interaction.guild_id == _home_state.guild_id:
+        return "📊 主伺服器的試算表與金鑰是用環境變數設定的，不能在這裡更改。"
+    if need_secret and _guild_fernet() is None:
+        return "🔒 機器人擁有者還沒開放其他伺服器綁定（尚未設定 `GUILD_SECRET_KEY`），請聯絡機器人擁有者。"
+    return None
+
+def bound_status_text(state) -> str:
+    return (
+        "📊 **這個伺服器目前綁定的試算表**\n"
+        f"<https://docs.google.com/spreadsheets/d/{state.sheet_id}>\n"
+        f"服務帳號：`{state.service_account_email}`\n\n"
+        "要換一份試算表、換金鑰，或解除綁定，請用下方按鈕。"
+    )
+
+class BindSheetModal(GuildModal, title="綁定 Google 試算表"):
+    requires_binding = False    # 還沒綁定的伺服器才需要這個表單
+
+    def __init__(self):
+        super().__init__()
+        self.sheet_input = discord.ui.TextInput(
+            label="試算表網址（或試算表 ID）",
+            placeholder="https://docs.google.com/spreadsheets/d/..."
+        )
+        self.key_input = discord.ui.TextInput(
+            label="服務帳號 JSON 金鑰（.json 檔整份內容）",
+            placeholder="從 { 開始到 } 結束，整份貼上",
+            style=discord.TextStyle.paragraph,
+            max_length=4000
+        )
+        self.add_item(self.sheet_input)
+        self.add_item(self.key_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        problem = binding_blocker(interaction)
+        if problem:
+            await interaction.followup.send(problem, ephemeral=True)
+            return
+        sheet_id = parse_sheet_id(self.sheet_input.value)
+        if not sheet_id:
+            await interaction.followup.send("❌ 看不懂這個試算表網址，請貼上瀏覽器網址列的完整網址。", ephemeral=True)
+            return
+        info, problem = parse_service_account_key(self.key_input.value)
+        if problem:
+            await interaction.followup.send(f"❌ {problem}", ephemeral=True)
+            return
+        try:
+            state, created = bind_guild_sheet(
+                interaction.guild_id, getattr(interaction.guild, "name", ""), sheet_id, info, interaction.user.id
+            )
+        except BindError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        except Exception as e:
+            print(f"⚠️ 綁定失敗（伺服器 {interaction.guild_id}）：{type(e).__name__}")
+            await interaction.followup.send("❌ 綁定時發生未預期的錯誤，請稍後再試一次。", ephemeral=True)
+            return
+        created_text = f"已自動建立分頁：{'、'.join(created)}\n" if created else ""
+        await interaction.followup.send(
+            "✅ **綁定完成！這個伺服器之後的資料都會存在你們自己的試算表裡。**\n"
+            f"{created_text}\n"
+            "接下來請再執行 `/管理者工具`：\n"
+            "　1. 「成員管理」新增成員、設定對應的 Discord ID\n"
+            "　2. 「設定頻道」填入收銀台、餐盤回收區、每日播報三個頻道的 ID",
+            ephemeral=True,
+        )
+
+class UnbindConfirmView(GuildView):
+    requires_binding = False
+
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="⚠️ 確認解除綁定", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        problem = binding_blocker(interaction, need_secret=False)
+        if problem:
+            await interaction.response.edit_message(content=problem, view=None)
+            return
+        unbind_guild_sheet(interaction.guild_id)
+        await interaction.response.edit_message(
+            content="🗑️ 已解除綁定，機器人已刪除保管的金鑰。你們試算表裡的資料都還在；"
+                    "建議再到 Google Cloud Console 把那把金鑰刪掉。",
+            view=None,
+        )
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="已取消，綁定維持不變。", view=None)
+
+class SheetSetupView(GuildView):
+    requires_binding = False    # 還沒綁定的伺服器也要能操作
+
+    def __init__(self, bound: bool):
+        super().__init__(timeout=300)
+        if bound:
+            self.bind_button.label = "🔁 換一份試算表／金鑰"
+        else:
+            self.remove_item(self.unbind_button)
+
+    @discord.ui.button(label="🔗 開始綁定", style=discord.ButtonStyle.primary)
+    async def bind_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        problem = binding_blocker(interaction)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+        await interaction.response.send_modal(BindSheetModal())
+
+    @discord.ui.button(label="🗑️ 解除綁定", style=discord.ButtonStyle.danger)
+    async def unbind_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        problem = binding_blocker(interaction, need_secret=False)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="⚠️ **確定要解除綁定嗎？**\n解除後這個伺服器的所有指令都會停用，直到重新綁定為止。"
+                    "你們試算表裡的資料不會被刪除。",
+            view=UnbindConfirmView(),
+        )
+
+class AdminToolsView(GuildView):
     def __init__(self, is_admin: bool):
         super().__init__(timeout=120)
         self.is_admin = is_admin
@@ -1480,11 +2134,30 @@ class AdminToolsView(discord.ui.View):
         elif self.choice == "channels":
             await interaction.response.send_modal(SetChannelsModal())
         elif self.choice == "sheet":
-            await interaction.response.send_modal(SetSheetModal())
+            state = _st()
+            if state.is_home:
+                await interaction.response.edit_message(
+                    content="📊 主伺服器的試算表與金鑰是用環境變數（`GOOGLE_SHEET_ID`、`GOOGLE_CREDENTIALS_BASE64`）設定的，"
+                            "不能在這裡更改。其他伺服器的管理員會在這裡綁定他們自己的試算表。",
+                    view=None,
+                )
+            else:
+                await interaction.response.edit_message(content=bound_status_text(state), view=SheetSetupView(bound=True))
 
 @bot.tree.command(name="管理者工具", description="成員管理／設定頻道／設定試算表")
 async def slash_admin_tools(interaction: discord.Interaction):
-    is_admin = interaction.user.guild_permissions.administrator
+    is_admin = user_is_admin(interaction)
+    if _guild_ctx.get() is None:
+        # 這個伺服器還沒綁定試算表：管理員看到綁定引導，其他人看到提示
+        if interaction.guild_id is None:
+            await interaction.response.send_message("❌ 請在伺服器裡使用這個指令。", ephemeral=True)
+        elif not _startup_done:
+            await interaction.response.send_message(STARTING_MESSAGE, ephemeral=True)
+        elif not is_admin:
+            await interaction.response.send_message(NOT_BOUND_MESSAGE, ephemeral=True)
+        else:
+            await interaction.response.send_message(SETUP_GUIDE, view=SheetSetupView(bound=False), ephemeral=True)
+        return
     await interaction.response.send_message("🛠️ **管理者工具** — 請選擇要做什麼：", view=AdminToolsView(is_admin), ephemeral=True)
 
 @bot.tree.command(name="修改帳目", description="修改特定編號的帳目內容")
@@ -1495,8 +2168,12 @@ async def slash_modify(interaction: discord.Interaction, 編號: int):
     if not old_data:
         await interaction.followup.send(f"❌ 找不到編號 {編號} 的紀錄。", ephemeral=True)
         return
-    await interaction.followup.send("請填寫修改內容：", ephemeral=True)
-    await interaction.response.send_modal(ModifyModal(編號, old_data))
+    # Modal 只能當作互動的第一個回應送出，前面查資料時已經 defer 過了，所以中間要隔一次按鈕點擊
+    await interaction.followup.send(
+        f"✏️ 編號 {編號:03d}：{old_data['debtor']} 欠 {old_data['creditor']}（{old_data['item']}）\n請按下方按鈕開啟修改表單：",
+        view=ModifyLauncherView(編號, old_data),
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="刪除帳目", description="依編號刪除紀錄")
 async def slash_delete(interaction: discord.Interaction, 編號: int):
@@ -1509,11 +2186,11 @@ async def slash_delete(interaction: discord.Interaction, 編號: int):
 
 @bot.tree.command(name="清空收銀台", description="強制清空收銀台頻道內的所有訊息")
 async def slash_purge(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+    if not user_is_admin(interaction):
         await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
         return
     config = load_config()
-    channel = bot.get_channel(config.get("cashier_channel_id", 0))
+    channel = get_guild_channel(config.get("cashier_channel_id", 0))
     if not channel:
         await interaction.response.send_message("❌ 找不到收銀台頻道，請先用 /設定頻道 設定。", ephemeral=True)
         return
@@ -1526,14 +2203,14 @@ async def slash_purge(interaction: discord.Interaction):
 
 @bot.tree.command(name="重新整理", description="重新讀取資料庫並更新收銀台/餐盤回收區表格")
 async def slash_refresh(interaction: discord.Interaction):
-    global _triggers_cache, _purchases_cache, _trips_cache
     await interaction.response.defer(ephemeral=True)
-    _triggers_cache = None
-    _purchases_cache = None
-    _trips_cache = None
+    # 只清「這個伺服器」的快取與試算表連線，不影響其他伺服器
+    state = _st()
+    state.clear_caches()
+    state.reset_connection()
     await update_cashier_board()
     await update_recovery_board()
-    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！觸發詞、代購、行程快取也已清除。", ephemeral=True)
+    await interaction.followup.send("✅ 收銀台與餐盤回收區已更新完畢！成員、設定、觸發詞、代購、行程快取也已清除。", ephemeral=True)
 
 @bot.tree.command(name="查帳", description="查詢某人的帳務彙總（公開顯示）")
 async def slash_check(interaction: discord.Interaction):
@@ -1647,22 +2324,20 @@ async def slash_clear(interaction: discord.Interaction, name1: str, name2: str):
     recovery.extend(["-" * 30, f"📊 **小計：{subtotal}**"])
 
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 結清時間跟記帳時間一樣存台灣時間
+    now_str = get_taiwan_now().strftime(TIME_FORMAT)
     _, history_ws = get_worksheets()
-    for r in target:
-        history_ws.append_row([r["id"], r["time"], now_str, r["debtor"], r["creditor"], r["amount"], r["rate"], r["item"]])
-
-    expense_ws, _ = get_worksheets()
-    target_ids = {r["id"] for r in target}
-    all_rows = expense_ws.get_all_values()
-    rows_to_keep = [all_rows[0]] + [row for row in all_rows[1:] if row and int(row[0]) not in target_ids]
-    expense_ws.clear()
-    expense_ws.update("A1", rows_to_keep)
+    history_ws.append_rows([
+        [r["id"], r["time"], now_str, r["debtor"], r["creditor"], r["amount"], r["rate"], r["item"]]
+        for r in target
+    ])
+    # 只刪掉這次結清的那幾列，不再「整張清空再寫回」——中途失敗也不會弄丟其他人的帳目
+    delete_expense_rows_by_ids(r["id"] for r in target)
 
     config = load_config()
-    recv_channel = bot.get_channel(config.get("recovery_channel_id", 0))
+    recv_channel = get_guild_channel(config.get("recovery_channel_id", 0))
     if recv_channel:
-        now_date = datetime.now().strftime("%y%m%d")
+        now_date = get_taiwan_now().strftime("%y%m%d")
         table_lines = []
         table_lines.append(f"```\n{n1} vs {n2}")
         table_lines.append("-" * 62)
@@ -1711,7 +2386,7 @@ async def slash_annual_review(interaction: discord.Interaction, 年份: int = No
         await interaction.followup.send(chunk)
 
 # ==================== 新增觸發詞 View + Modal ====================
-class AddTriggerView(discord.ui.View):
+class AddTriggerView(GuildView):
     def __init__(self, image_url: str = ""):
         super().__init__(timeout=120)
         self.image_url  = image_url
@@ -1753,7 +2428,7 @@ class AddTriggerView(discord.ui.View):
             AddTriggerModal(self.match_type, self.reply_type, self.image_url)
         )
 
-class AddTriggerModal(discord.ui.Modal, title="新增觸發詞"):
+class AddTriggerModal(GuildModal, title="新增觸發詞"):
     def __init__(self, match_type: str, reply_type: str, image_url: str):
         super().__init__()
         self.match_type = match_type
@@ -1780,6 +2455,10 @@ class AddTriggerModal(discord.ui.Modal, title="新增觸發詞"):
         keyword      = self.keyword_input.value.strip()
         response_text = self.response_input.value.strip()
         mention      = self.mention_input.value.strip()
+        problem = check_trigger_keyword(keyword, self.match_type)
+        if problem:
+            await interaction.followup.send(f"❌ {problem}", ephemeral=True)
+            return
         try:
             prob = int(self.prob_input.value.strip() or "100")
             if not 0 <= prob <= 100: raise ValueError
@@ -1804,7 +2483,7 @@ class AddTriggerModal(discord.ui.Modal, title="新增觸發詞"):
         await interaction.followup.send("\n".join(parts), ephemeral=True)
 
 # ==================== 編輯觸發詞 View + Modal ====================
-class EditTriggerView(discord.ui.View):
+class EditTriggerView(GuildView):
     def __init__(self, trigger: dict):
         super().__init__(timeout=120)
         self.trigger    = trigger
@@ -1848,7 +2527,7 @@ class EditTriggerView(discord.ui.View):
             EditTriggerModal(self.trigger_id, self.match_type, self.reply_type, self.image_url, self.trigger)
         )
 
-class EditTriggerModal(discord.ui.Modal):
+class EditTriggerModal(GuildModal):
     def __init__(self, trigger_id: int, match_type: str, reply_type: str, image_url: str, existing: dict):
         super().__init__(title=f"編輯觸發詞 - 編號 {trigger_id:03d}")
         self.trigger_id = trigger_id
@@ -1876,6 +2555,10 @@ class EditTriggerModal(discord.ui.Modal):
         keyword      = self.keyword_input.value.strip()
         response_text = self.response_input.value.strip()
         mention      = self.mention_input.value.strip()
+        problem = check_trigger_keyword(keyword, self.match_type)
+        if problem:
+            await interaction.followup.send(f"❌ {problem}", ephemeral=True)
+            return
         try:
             prob = int(self.prob_input.value.strip() or "100")
             if not 0 <= prob <= 100: raise ValueError
@@ -1912,7 +2595,9 @@ def build_trigger_line(t: dict) -> str:
     ml = mt_labels.get(t["match_type"], t["match_type"])
     rl = rt_labels.get(t["reply_type"], t["reply_type"])
     meta = f"　[{ml} / {rl} / {t['probability']}%]"
-    return f"**[{t['id']:03d}]** `{t['keyword']}`{preview_mention}{preview_text}{preview_img}{meta}"
+    problem = check_trigger_keyword(t["keyword"], t["match_type"])
+    warning = f"\n　⚠️ 這筆不會觸發：{problem}" if problem else ""
+    return f"**[{t['id']:03d}]** `{t['keyword']}`{preview_mention}{preview_text}{preview_img}{meta}{warning}"
 
 def build_triggers_display():
     triggers = load_triggers()
@@ -1922,7 +2607,7 @@ def build_triggers_display():
     lines.extend(build_trigger_line(t) for t in triggers)
     return "\n".join(lines)
 
-class TriggerManageView(discord.ui.View):
+class TriggerManageView(GuildView):
     def __init__(self, is_admin: bool):
         super().__init__(timeout=120)
         if not is_admin:
@@ -1944,7 +2629,7 @@ class TriggerManageView(discord.ui.View):
             ephemeral=True
         )
 
-class TriggerSelectView(discord.ui.View):
+class TriggerSelectView(GuildView):
     def __init__(self, options):
         super().__init__(timeout=60)
         select = discord.ui.Select(placeholder="選擇觸發詞", options=options)
@@ -1962,7 +2647,7 @@ class TriggerSelectView(discord.ui.View):
             view=TriggerActionView(trigger)
         )
 
-class TriggerActionView(discord.ui.View):
+class TriggerActionView(GuildView):
     def __init__(self, trigger: dict):
         super().__init__(timeout=60)
         self.trigger = trigger
@@ -1988,7 +2673,7 @@ class TriggerActionView(discord.ui.View):
 
 @bot.tree.command(name="管理觸發詞", description="查看所有觸發詞，管理員可編輯或刪除")
 async def slash_triggers(interaction: discord.Interaction):
-    is_admin = interaction.user.guild_permissions.administrator
+    is_admin = user_is_admin(interaction)
     content  = build_triggers_display()
     view     = TriggerManageView(is_admin)
     await interaction.response.send_message(content=content, view=view, ephemeral=True)
@@ -1996,7 +2681,7 @@ async def slash_triggers(interaction: discord.Interaction):
 @bot.tree.command(name="新增觸發詞", description="新增關鍵字觸發回應（管理員）")
 @app_commands.describe(image="附上圖片自動上傳 imgbb（選填）")
 async def slash_add_trigger(interaction: discord.Interaction, image: discord.Attachment = None):
-    if not interaction.user.guild_permissions.administrator:
+    if not user_is_admin(interaction):
         await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
@@ -2011,7 +2696,7 @@ async def slash_add_trigger(interaction: discord.Interaction, image: discord.Att
                                     view=AddTriggerView(image_url), ephemeral=True)
 
 # ==================== 每日提醒 ====================
-class ReminderActionView(discord.ui.View):
+class ReminderActionView(GuildView):
     def __init__(self):
         super().__init__(timeout=120)
         self.action = "add"
@@ -2036,7 +2721,7 @@ class ReminderActionView(discord.ui.View):
             )
         elif self.action == "delete":
             reminders = load_reminders()
-            if not interaction.user.guild_permissions.administrator:
+            if not user_is_admin(interaction):
                 reminders = [r for r in reminders if r["created_by"] == str(interaction.user.id)]
             if not reminders:
                 await interaction.response.edit_message(content="⚠️ 目前沒有可以刪除的每日提醒。", view=None)
@@ -2047,7 +2732,7 @@ class ReminderActionView(discord.ui.View):
             ][:25]
             await interaction.response.edit_message(content="🗑️ 請選擇要刪除的每日提醒：", view=ReminderDeleteSelectView(options))
         else:  # settings
-            if not interaction.user.guild_permissions.administrator:
+            if not user_is_admin(interaction):
                 await interaction.response.edit_message(content="❌ 只有管理員能修改播報設定", view=None)
                 return
             config = load_config()
@@ -2056,7 +2741,7 @@ class ReminderActionView(discord.ui.View):
                 view=BroadcastSettingsView(config)
             )
 
-class BroadcastSettingsView(discord.ui.View):
+class BroadcastSettingsView(GuildView):
     def __init__(self, config: dict):
         super().__init__(timeout=120)
         self.stock_enabled = config.get("stock_report_enabled", "on") == "on"
@@ -2069,7 +2754,7 @@ class BroadcastSettingsView(discord.ui.View):
         stock_select.callback = self.stock_callback
         self.add_item(stock_select)
 
-        jpy_select = discord.ui.Select(placeholder="日幣匯率播報", options=[
+        jpy_select = discord.ui.Select(placeholder="匯率播報（日幣＋美金）", options=[
             discord.SelectOption(label="開啟", value="on", default=self.jpy_enabled),
             discord.SelectOption(label="關閉", value="off", default=not self.jpy_enabled),
         ])
@@ -2088,14 +2773,14 @@ class BroadcastSettingsView(discord.ui.View):
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BroadcastSettingsModal(self.stock_enabled, self.jpy_enabled))
 
-class BroadcastSettingsModal(discord.ui.Modal, title="播報設定"):
+class BroadcastSettingsModal(GuildModal, title="播報設定"):
     def __init__(self, stock_enabled: bool, jpy_enabled: bool):
         super().__init__()
         self.stock_enabled = stock_enabled
         self.jpy_enabled = jpy_enabled
         config = load_config()
         self.threshold_input = discord.ui.TextInput(
-            label="匯率划算門檻（低於這個值才顯示划算文案）",
+            label="日幣划算門檻（低於這個值才顯示划算文案）",
             default=str(config.get("jpy_threshold", JPY_THRESHOLD)),
         )
         self.add_item(self.threshold_input)
@@ -2113,12 +2798,12 @@ class BroadcastSettingsModal(discord.ui.Modal, title="播報設定"):
         await interaction.followup.send(
             f"✅ **播報設定已更新**\n"
             f"　美股播報：{'開啟' if self.stock_enabled else '關閉'}\n"
-            f"　匯率播報：{'開啟' if self.jpy_enabled else '關閉'}\n"
-            f"　匯率划算門檻：{threshold}",
+            f"　匯率播報（日幣＋美金）：{'開啟' if self.jpy_enabled else '關閉'}\n"
+            f"　日幣划算門檻：{threshold}",
             ephemeral=True
         )
 
-class ReminderDeleteSelectView(discord.ui.View):
+class ReminderDeleteSelectView(GuildView):
     def __init__(self, options):
         super().__init__(timeout=60)
         select = discord.ui.Select(placeholder="選擇要刪除的提醒", options=options)
@@ -2132,7 +2817,7 @@ class ReminderDeleteSelectView(discord.ui.View):
         else:
             await interaction.response.edit_message(content=f"❌ 找不到編號 {rid:03d}，可能已被刪除", view=None)
 
-class AddReminderView(discord.ui.View):
+class AddReminderView(GuildView):
     def __init__(self):
         super().__init__(timeout=180)
         self.hour = 9
@@ -2170,7 +2855,7 @@ class AddReminderView(discord.ui.View):
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AddReminderModal(self.hour, self.minute, self.mention_name))
 
-class AddReminderModal(discord.ui.Modal, title="新增每日提醒"):
+class AddReminderModal(GuildModal, title="新增每日提醒"):
     def __init__(self, hour: int, minute: int, mention_name: str):
         super().__init__()
         self.hour = hour
@@ -2227,8 +2912,13 @@ def _format_location(location: str) -> str:
     location = (location or "").strip()
     if not location:
         return "（未填寫）"
-    if location.lower().startswith(("http://", "https://")):
-        return f"[📍 開啟地圖／連結]({location})"
+    # 只有「整段就是一個網址」才包成可點的連結，並把實際網域寫在連結文字上，
+    # 避免連結文字跟真正會去的地方對不上；其餘情況原樣顯示，Discord 會自己把網址變成連結。
+    if location.lower().startswith(("http://", "https://")) and not re.search(r"[\s()<>\[\]]", location):
+        host = urlparse(location).hostname or ""
+        link = f"[📍 開啟連結（{host}）]({location})"
+        if re.fullmatch(r"[a-z0-9.-]+", host) and len(link) <= 1024:
+            return link
     return location[:1024]
 
 def build_purchase_embed(p: dict) -> discord.Embed:
@@ -2266,7 +2956,7 @@ def build_purchase_embed(p: dict) -> discord.Embed:
             embed.set_footer(text=f"🖼️ 尚有 {len(images) - 1} 張圖片，可用下方按鈕切換")
     return embed
 
-class PurchaseDisclaimerView(discord.ui.View):
+class PurchaseDisclaimerView(GuildView):
     def __init__(self, context: dict):
         super().__init__(timeout=120)
         self.context = context
@@ -2275,7 +2965,7 @@ class PurchaseDisclaimerView(discord.ui.View):
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(PurchaseModalA(self.context))
 
-class PurchaseModalA(discord.ui.Modal, title="代購委託 (1/2) - 物品資訊"):
+class PurchaseModalA(GuildModal, title="代購委託 (1/2) - 物品資訊"):
     def __init__(self, context: dict):
         super().__init__()
         self.context = context
@@ -2313,7 +3003,7 @@ class PurchaseModalA(discord.ui.Modal, title="代購委託 (1/2) - 物品資訊"
             ephemeral=True,
         )
 
-class PurchaseModalBLauncherView(discord.ui.View):
+class PurchaseModalBLauncherView(GuildView):
     def __init__(self, context: dict):
         super().__init__(timeout=120)
         self.context = context
@@ -2322,7 +3012,7 @@ class PurchaseModalBLauncherView(discord.ui.View):
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(PurchaseModalB(self.context))
 
-class PurchaseModalB(discord.ui.Modal, title="代購委託 (2/2) - 金額與聯絡方式"):
+class PurchaseModalB(GuildModal, title="代購委託 (2/2) - 金額與聯絡方式"):
     def __init__(self, context: dict):
         super().__init__()
         self.context = context
@@ -2404,7 +3094,7 @@ class PurchaseModalB(discord.ui.Modal, title="代購委託 (2/2) - 金額與聯�
             ephemeral=True,
         )
 
-class SkipImagesView(discord.ui.View):
+class SkipImagesView(GuildView):
     def __init__(self):
         super().__init__(timeout=90)
 
@@ -2438,20 +3128,22 @@ async def collect_purchase_images_via_dm(interaction: discord.Interaction, max_i
             message = msg_task.result()
         except asyncio.TimeoutError:
             break
+        failed = False
         for att in message.attachments:
             if len(collected) >= max_images:
                 break
             try:
                 collected.append(await upload_to_imgbb(att))
-            except Exception:
-                pass
+            except Exception as e:
+                failed = True
+                print(f"⚠️ 代購圖片上傳失敗：{e}")
         try:
-            await message.add_reaction("✅")
+            await message.add_reaction("⚠️" if failed else "✅")
         except discord.HTTPException:
             pass
     return collected
 
-class PurchaseActionView(discord.ui.View):
+class PurchaseActionView(GuildView):
     def __init__(self, purchase: dict):
         super().__init__(timeout=180)
         self.purchase = purchase
@@ -2501,7 +3193,7 @@ class PurchaseActionView(discord.ui.View):
 
 PURCHASE_PAGE_SIZE = 25
 
-class PurchaseQueueView(discord.ui.View):
+class PurchaseQueueView(GuildView):
     def __init__(self, purchases: list, page: int = 0):
         super().__init__(timeout=180)
         self.purchases = purchases
@@ -2583,7 +3275,7 @@ async def slash_purchase_request(
         ephemeral=True,
     )
 
-class EditPurchaseModalA(discord.ui.Modal, title="修改委託 (1/2) - 物品資訊"):
+class EditPurchaseModalA(GuildModal, title="修改委託 (1/2) - 物品資訊"):
     def __init__(self, purchase: dict):
         super().__init__()
         self.purchase_id = purchase["id"]
@@ -2624,7 +3316,7 @@ class EditPurchaseModalA(discord.ui.Modal, title="修改委託 (1/2) - 物品資
             ephemeral=True,
         )
 
-class EditPurchaseModalBLauncherView(discord.ui.View):
+class EditPurchaseModalBLauncherView(GuildView):
     def __init__(self, purchase: dict):
         super().__init__(timeout=120)
         self.purchase = purchase
@@ -2633,7 +3325,7 @@ class EditPurchaseModalBLauncherView(discord.ui.View):
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(EditPurchaseModalB(self.purchase))
 
-class EditPurchaseModalB(discord.ui.Modal, title="修改委託 (2/2) - 金額與聯絡方式"):
+class EditPurchaseModalB(GuildModal, title="修改委託 (2/2) - 金額與聯絡方式"):
     def __init__(self, purchase: dict):
         super().__init__()
         self.purchase_id = purchase["id"]
@@ -2702,7 +3394,7 @@ class EditPurchaseModalB(discord.ui.Modal, title="修改委託 (2/2) - 金額與
             ephemeral=True,
         )
 
-class RequesterActionView(discord.ui.View):
+class RequesterActionView(GuildView):
     def __init__(self, purchase: dict):
         super().__init__(timeout=180)
         self.purchase = purchase
@@ -2733,7 +3425,7 @@ class RequesterActionView(discord.ui.View):
 
 REQUESTER_PAGE_SIZE = 25
 
-class RequesterQueueView(discord.ui.View):
+class RequesterQueueView(GuildView):
     def __init__(self, purchases: list, page: int = 0):
         super().__init__(timeout=180)
         self.purchases = purchases
@@ -2781,7 +3473,7 @@ class RequesterQueueView(discord.ui.View):
     async def next_page(self, interaction: discord.Interaction):
         await interaction.response.edit_message(view=RequesterQueueView(self.purchases, self.page + 1))
 
-class PurchaseProgressModeView(discord.ui.View):
+class PurchaseProgressModeView(GuildView):
     def __init__(self, as_agent: list, as_requester: list):
         super().__init__(timeout=120)
         self.as_agent = as_agent
@@ -2831,7 +3523,7 @@ async def slash_purchase_progress(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-class TripSetModal(discord.ui.Modal, title="設定我的代購行程"):
+class TripSetModal(GuildModal, title="設定我的代購行程"):
     def __init__(self, existing_text: str = ""):
         super().__init__()
         self.itinerary_input = discord.ui.TextInput(
@@ -2850,7 +3542,7 @@ class TripSetModal(discord.ui.Modal, title="設定我的代購行程"):
             ephemeral=True,
         )
 
-class TripEndConfirmView(discord.ui.View):
+class TripEndConfirmView(GuildView):
     def __init__(self):
         super().__init__(timeout=60)
 
@@ -2871,7 +3563,7 @@ class TripEndConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="已取消，行程與委託維持不變。", view=None)
 
-class TripActionView(discord.ui.View):
+class TripActionView(GuildView):
     def __init__(self):
         super().__init__(timeout=120)
         self.action = "start"
@@ -2913,7 +3605,7 @@ async def slash_trip(interaction: discord.Interaction):
 @bot.tree.command(name="代購強制刪除", description="管理員緊急清空某位代購人名下所有委託（不會顯示物品內容，僅供代購人失聯等情況使用）")
 @app_commands.describe(代購人id="代購人的 Discord 使用者 ID（純數字，開發者模式右鍵複製，即使對方已離開群組也能用）")
 async def slash_purchase_force_delete(interaction: discord.Interaction, 代購人id: str):
-    if not interaction.user.guild_permissions.administrator:
+    if not user_is_admin(interaction):
         await interaction.response.send_message("❌ 只有管理員才能使用此指令", ephemeral=True)
         return
     agent_id = 代購人id.strip()
@@ -2936,7 +3628,7 @@ async def slash_purchase_force_delete(interaction: discord.Interaction, 代購�
         ephemeral=True,
     )
 
-class PurchaseForceDeleteConfirmView(discord.ui.View):
+class PurchaseForceDeleteConfirmView(GuildView):
     def __init__(self, agent_id: str):
         super().__init__(timeout=60)
         self.agent_id = agent_id
@@ -2984,10 +3676,49 @@ async def fetch_us_market_summary():
                 lines.append(f"　{label}：查詢失敗")
     return lines, any_up, any_down
 
-@tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
-async def daily_rate_check():
+async def fetch_twd_rate(session, currency: str) -> float:
+    """查詢 1 單位外幣可以換多少台幣（open.er-api.com，免金鑰）。"""
+    async with session.get(f"https://open.er-api.com/v6/latest/{currency}") as resp:
+        data = await resp.json()
+    return data["rates"]["TWD"]
+
+class _DailyData:
+    """每日播報用到的外部資料。所有伺服器共用同一份：需要時才查，而且只查一次。"""
+    _UNSET = object()
+
+    def __init__(self):
+        self._rates = None
+        self._stocks = self._UNSET
+
+    async def rates(self) -> dict:
+        """{"JPY": 匯率, "USD": 匯率}；查詢失敗的那一個是 None，兩個各自獨立。"""
+        if self._rates is None:
+            import aiohttp
+            rates = {}
+            async with aiohttp.ClientSession() as session:
+                for currency, name in (("JPY", "日幣"), ("USD", "美金")):
+                    try:
+                        rates[currency] = await fetch_twd_rate(session, currency)
+                    except Exception as e:
+                        print(f"⚠️ {name}匯率查詢失敗：{e}")
+                        rates[currency] = None
+            self._rates = rates
+        return self._rates
+
+    async def stocks(self):
+        """(各指數的文字, 有沒有大漲, 有沒有大跌)；整個查詢失敗時是 None。"""
+        if self._stocks is self._UNSET:
+            try:
+                self._stocks = await fetch_us_market_summary()
+            except Exception as e:
+                print(f"⚠️ 美股資料查詢失敗：{e}")
+                self._stocks = None
+        return self._stocks
+
+async def send_daily_report(data: _DailyData):
+    """把每日播報發到「目前這個伺服器」的播報頻道（依那個伺服器自己的開關與門檻）。"""
     config = load_config()
-    channel = bot.get_channel(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
+    channel = get_guild_channel(config.get("notify_channel_id", default_notify_channel_id()))
     if not channel:
         return
 
@@ -3000,22 +3731,25 @@ async def daily_rate_check():
 
     lines = []
     if jpy_enabled:
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://open.er-api.com/v6/latest/JPY") as resp:
-                    data = await resp.json()
-                    rate = data["rates"]["TWD"]
-            lines.append(f"💴 **現在日幣匯率：1 JPY = {rate:.4f} TWD**")
-            if rate < threshold:
-                lines.append("現在日幣正划算，老師們快換日幣吧，替老師精打細算也是我的工作呢 📊")
-        except Exception as e:
-            print(f"⚠️ 匯率查詢失敗：{e}")
-            lines.append("💴 匯率查詢失敗")
+        rates = await data.rates()
+        jpy_rate, usd_rate = rates["JPY"], rates["USD"]
+        if jpy_rate is not None:
+            lines.append(f"💴 **現在日幣匯率：1 JPY = {jpy_rate:.4f} TWD**")
+        else:
+            lines.append("💴 日幣匯率查詢失敗")
+        if usd_rate is not None:
+            lines.append(f"💵 **現在美金匯率：1 USD = {usd_rate:.3f} TWD**")
+        else:
+            lines.append("💵 美金匯率查詢失敗")
+        if jpy_rate is not None and jpy_rate < threshold:
+            lines.append("現在日幣正划算，老師們快換日幣吧，替老師精打細算也是我的工作呢 📊")
 
     if stock_enabled:
-        try:
-            stock_lines, any_up, any_down = await fetch_us_market_summary()
+        stocks = await data.stocks()
+        if stocks is None:
+            lines.append("📈 美股資料查詢失敗")
+        else:
+            stock_lines, any_up, any_down = stocks
             if lines:
                 lines.append("")
             lines.append("📈 **昨夜美股收盤**")
@@ -3026,20 +3760,28 @@ async def daily_rate_check():
             if any_down:
                 lines.append("")
                 lines.append("嗚嗚嗚，又是睡公園的日子，今天要跟SRT小隊搶公園廁所了")
-        except Exception as e:
-            print(f"⚠️ 美股資料查詢失敗：{e}")
-            lines.append("📈 美股資料查詢失敗")
 
     if lines:
         await channel.send("\n".join(lines))
 
-@tasks.loop(minutes=1)
-async def reminder_check():
+@tasks.loop(time=dtime(1, 0, 0))  # UTC 01:00 = 台灣時間 09:00
+async def daily_rate_check():
+    data = _DailyData()
+    for state in all_states():
+        _guild_ctx.set(state)
+        # 任何一個伺服器出錯都不能讓整個排程停掉，也不能影響其他伺服器
+        try:
+            await send_daily_report(data)
+        except Exception as e:
+            print(f"⚠️ {state.label()} 的每日播報失敗：{e}")
+    _guild_ctx.set(None)
+
+async def send_due_reminders(now):
+    """發送「目前這個伺服器」這一分鐘到期的每日提醒。"""
     config = load_config()
-    channel = bot.get_channel(config.get("notify_channel_id", NOTIFY_CHANNEL_ID))
+    channel = get_guild_channel(config.get("notify_channel_id", default_notify_channel_id()))
     if not channel:
         return
-    now = get_taiwan_now()
     reminders = [r for r in load_reminders() if r["hour"] == now.hour and r["minute"] == now.minute]
     if not reminders:
         return
@@ -3050,7 +3792,28 @@ async def reminder_check():
         if r["mention_name"]:
             discord_id = name_to_id.get(r["mention_name"])
             mention = f"<@{discord_id}> " if discord_id else f"{r['mention_name']} "
-        await channel.send(f"⏰ {mention}{r['content']}")
+        # 單一則提醒發送失敗不能讓其他提醒跟著沒發
+        try:
+            await channel.send(f"⏰ {mention}{r['content']}")
+        except Exception as e:
+            print(f"⚠️ 每日提醒 [{r['id']:03d}] 發送失敗：{e}")
+
+@tasks.loop(minutes=1)
+async def reminder_check():
+    if _startup_done and not _bindings_loaded:
+        # 啟動時主試算表剛好連不上的話，這裡會每分鐘重試，直到其他伺服器的綁定資料讀進來
+        try:
+            load_guild_bindings()
+        except Exception as e:
+            print(f"⚠️ 讀取其他伺服器的綁定資料失敗：{type(e).__name__}")
+    now = get_taiwan_now()
+    for state in all_states():
+        _guild_ctx.set(state)
+        try:
+            await send_due_reminders(now)
+        except Exception as e:
+            print(f"⚠️ {state.label()} 的每日提醒檢查失敗：{e}")
+    _guild_ctx.set(None)
 
 # ==================== 關鍵字偵測 ====================
 ROLE_ID = 937360224493396018
@@ -3062,9 +3825,16 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 檢查是否包含關鍵字（私訊沒有 guild，略過）
-    if message.guild and any(kw in message.content for kw in KEYWORDS):
-        role = message.guild.get_role(ROLE_ID)
+    # 這則訊息在哪個伺服器，就只用那個伺服器的資料；私訊、還沒綁定試算表的伺服器都不處理
+    state = state_for_guild(message.guild.id) if message.guild else None
+    _guild_ctx.set(state)
+    if state is None:
+        return
+
+    # 檢查是否包含請客關鍵字
+    if any(kw in message.content for kw in KEYWORDS):
+        role_id = load_config().get("treat_role_id", default_treat_role_id())
+        role = message.guild.get_role(role_id) if isinstance(role_id, int) and role_id else None
         if role:
             await message.channel.send(f"🍽️ 有人要請客！{role.mention} 快來！")
         try:
@@ -3083,11 +3853,13 @@ async def on_message(message: discord.Message):
         for trigger in triggers:
             mt = trigger["match_type"]
             kw = trigger["keyword"]
+            if not kw.strip():
+                continue  # 空白關鍵詞會讓每一則訊息都觸發，直接略過
             if mt == "exact":
                 hit = content_lower.strip() == kw.lower().strip()
             elif mt == "regex":
-                try: hit = bool(re.search(kw, message.content, re.IGNORECASE))
-                except re.error: hit = False
+                pattern = compile_trigger_regex(kw)
+                hit = bool(pattern and pattern.search(message.content))
             else:
                 hit = kw.lower() in content_lower
             if hit:
@@ -3118,11 +3890,80 @@ async def on_message(message: discord.Message):
     # 確保其他指令正常運作
     await bot.process_commands(message)
 
+def resolve_home_guild_id():
+    """判斷哪一個伺服器是主伺服器（用環境變數裡那份試算表的伺服器）。回傳 (伺服器 ID, 判斷依據)。
+    判斷不出來時回傳 (None, "")：寧可讓主試算表暫時沒有任何伺服器能用，也不能開放給不對的伺服器。"""
+    raw = os.getenv("HOME_GUILD_ID") or os.getenv("ALLOWED_GUILD_IDS") or ""
+    match = re.search(r"\d{15,}", raw)
+    if match:
+        return int(match.group()), "環境變數 HOME_GUILD_ID"
+    # 沒設定環境變數：先看程式裡寫死的預設播報頻道，再看主試算表 config 裡設定好的頻道，它們在哪個伺服器
+    candidates = [NOTIFY_CHANNEL_ID]
+    _guild_ctx.set(_home_state)
+    try:
+        config = load_config()
+        candidates += [config.get(key) for key in ("notify_channel_id", "cashier_channel_id", "recovery_channel_id")]
+    finally:
+        _guild_ctx.set(None)
+    for channel_id in candidates:
+        channel = bot.get_channel(channel_id) if isinstance(channel_id, int) and channel_id else None
+        guild = getattr(channel, "guild", None)
+        if guild:
+            return guild.id, f"頻道 {channel_id} 所在的伺服器（建議改用環境變數 HOME_GUILD_ID 明確指定）"
+    return None, ""
+
 @bot.event
 async def on_ready():
+    global _startup_done
     print(f"成功登入！機器人：{bot.user}")
-    daily_rate_check.start()
-    reminder_check.start()
+    if not _startup_done:
+        guild_id, source = resolve_home_guild_id()
+        if guild_id:
+            _home_state.guild_id = guild_id
+            home_guild = bot.get_guild(guild_id)
+            print(f"🏠 主伺服器：{home_guild.name if home_guild else '（機器人不在這個伺服器裡！）'}（{guild_id}），依據：{source}")
+        else:
+            print("⚠️ 無法判斷哪個伺服器是主伺服器！請在環境變數設定 HOME_GUILD_ID。在那之前，主試算表不會開放給任何伺服器使用。")
+        try:
+            load_guild_bindings()
+        except Exception as e:
+            print(f"⚠️ 讀取其他伺服器的綁定資料失敗（稍後會自動重試）：{type(e).__name__}")
+        # 主試算表舊資料的時間轉換（UTC → 台灣時間，只會做一次）。這裡失敗的話，之後第一次讀寫帳目時會再試。
+        _guild_ctx.set(_home_state)
+        try:
+            ensure_time_storage()
+        except Exception as e:
+            print(f"⚠️ 主試算表的時間轉換暫時失敗（稍後會自動重試）：{type(e).__name__}")
+        finally:
+            _guild_ctx.set(None)
+        if _guild_fernet() is None:
+            print("🔒 未設定 GUILD_SECRET_KEY：其他伺服器目前無法綁定自己的試算表")
+        _startup_done = True
+    for guild in bot.guilds:
+        state = state_for_guild(guild.id)
+        status = "主伺服器" if state is _home_state else ("已綁定自己的試算表" if state else "尚未綁定試算表（指令不會有反應）")
+        print(f"　• {guild.name}（{guild.id}）：{status}")
+    # on_ready 在斷線重連時會再觸發，排程已經在跑就不要重複啟動
+    if not daily_rate_check.is_running():
+        daily_rate_check.start()
+    if not reminder_check.is_running():
+        reminder_check.start()
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    print(f"➕ 被加進新的伺服器：{guild.name}（{guild.id}）")
+    if state_for_guild(guild.id) is not None:
+        return
+    channel = guild.system_channel
+    if channel is None or not channel.permissions_for(guild.me).send_messages:
+        return
+    try:
+        await channel.send(
+            "👋 感謝邀請！這個機器人把每個伺服器的資料存在各自的 Google 試算表裡，"
+            "請伺服器管理員執行 `/管理者工具`，照著引導綁定你們自己的試算表後就能開始使用。"
+        )
+    except discord.HTTPException:
+        pass
 
 keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))

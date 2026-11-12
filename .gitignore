@@ -5,3 +5,4 @@ config.json
 expense_v2.csv
 history.csv
 __pycache__/
+SECURITY.md
